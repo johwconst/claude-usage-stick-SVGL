@@ -196,11 +196,33 @@ Pins and the validated display/color/touch configuration are in
 [`firmware/REFERENCIA-HARDWARE-LVGL.md`](firmware/REFERENCIA-HARDWARE-LVGL.md) and the reference
 bring-up sketch in [`firmware/bringup/`](firmware/bringup/).
 
-### 3D-printable case
+---
 
-A ready-to-print case for this display board is included:
-[`3D Case/Case_JC3248W535C.stl`](3D%20Case/Case_JC3248W535C.stl) — print it, slide the board in
-and the Usage Stick is desk-ready.
+## 3D-printable cases
+
+Three ways to put it on a desk. The first two ship in this repo as STL; the third is a community
+design.
+
+<table>
+  <tr>
+    <td align="center" valign="top" width="33%"><img src="assets/case-simples.png" alt="Desk wedge case (render)"><br><b>Desk wedge</b></td>
+    <td align="center" valign="top" width="33%"><img src="assets/case-articulado.png" alt="Articulated stand (render)"><br><b>Articulated stand</b></td>
+    <td align="center" valign="top" width="33%"><a href="https://makerworld.com/en/models/3329534-case-claude-para-display-esp32-mascote"><img src="assets/case-clawd-vinnialfonso.jpg" alt="Clawd-shaped case by Vinicius Alfonso, printed in orange"></a><br><b>Clawd</b> — by Vinicius Alfonso</td>
+  </tr>
+</table>
+
+- **Desk wedge** — [`3D Case/Case_JC3248W535C.stl`](3D%20Case/Case_JC3248W535C.stl). One piece:
+  print it, slide the board in and the Usage Stick is desk-ready.
+- **Articulated stand** — [`3D Case/Articulado/`](3D%20Case/Articulado/). Four parts — base, hinge
+  joint, case and display holder — so the screen tilts to whatever angle your desk needs.
+- **Clawd** — the mascot itself, arms and legs included, holding the screen. Designed by
+  **Vinicius Alfonso** (@vinnialfonso) and published on MakerWorld; the photo is his print running
+  this firmware. Not bundled here —
+  [download it from MakerWorld](https://makerworld.com/en/models/3329534-case-claude-para-display-esp32-mascote).
+
+Made a case of your own? Open a PR adding it to this list.
+
+The two renders come from `tools/gen_case_renders.py`, straight from the STL files.
 
 ---
 
@@ -245,6 +267,47 @@ python3 tools/token_bridge.py --loop 120    # keep pushing every 2 min
 
 The device advertises itself via mDNS as **`claude-stick.local`** while the dashboard is open. If
 the row disappears, the data just went stale (> 15 min without a push).
+
+#### Keeping it running via a Claude Code hook (alternative to cron)
+
+If your main use of the bridge is with the **Claude Code CLI**, you don't need a system cron job:
+a `SessionStart` hook can launch it automatically the first time you open a session. Once started
+it keeps running in the background until you log out or reboot (stop it sooner with
+`pkill -f token_bridge.py`); the log goes to `~/Library/Logs/` on macOS and `~/.local/state/` on
+Linux, or wherever `CLAUDE_STICK_BRIDGE_LOG` points.
+
+[`tools/claude-code-token-bridge-hook.sh`](tools/claude-code-token-bridge-hook.sh) is a ready-made
+helper that checks (via `pgrep`) whether the bridge is already running before starting it, so
+opening several terminal tabs/sessions never spawns duplicate loops. Wire it into
+`~/.claude/settings.json`:
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash /absolute/path/to/claude-usage-stick-SVGL/tools/claude-code-token-bridge-hook.sh",
+            "timeout": 15
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+For a multi-account setup, set `CLAUDE_STICK_BRIDGE_ACCOUNT` to the label configured on the device
+before Claude Code starts (e.g. in your shell profile), same idea as the `--account` flag above.
+
+> **Don't inline the `pgrep`/`nohup` logic directly in the hook's `command` string.** The wrapping
+> shell process's own argv then contains the search pattern (since it's part of the command text
+> itself), and `pgrep -f` can intermittently match that wrapper process instead of the real bridge
+> — silently skipping the actual start. Keeping the logic in a separate script file avoids this,
+> since the script's own invocation (`bash .../claude-code-token-bridge-hook.sh`) doesn't contain
+> the pattern being searched for.
 
 With multiple accounts, run one bridge per machine with `--account <label>` (the label configured
 on the gadget). `GET /window` reports which account is active; a push for another account gets a
@@ -468,8 +531,9 @@ tools/
   gen_mockups.py                # regenerates assets/mock-*.png (the screens)
   gen_banners.py                # regenerates assets/banner-*.png (README banners)
   gen_social.py                 # regenerates assets/social-preview*.png (repo social card)
+  gen_case_renders.py           # regenerates assets/case-*.png (renders of the STL cases)
 assets/                         # screen mockups, README banners + brand assets (brand/)
-3D Case/                        # printable case (STL) for the board
+3D Case/                        # printable cases (STL) for the board
 ```
 
 ## Where to tweak
