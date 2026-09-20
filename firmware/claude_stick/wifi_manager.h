@@ -21,7 +21,31 @@ public:
         _loadAll();
         WiFi.mode(WIFI_STA);
         WiFi.disconnect();
+        // Modem sleep default (DTIM) e a causa classica de queda/latencia nesta
+        // placa: o radio dorme entre beacons, perde beacon, o AP derruba.
+        WiFi.setSleep(false);
+        WiFi.setAutoReconnect(true);
+        WiFi.persistent(false);   // nao gravar credencial na NVS do core a cada begin()
         return true;
+    }
+
+    // Reconexao NAO bloqueante, chamada todo loop(). O autoReconnect do core cobre
+    // a queda simples do mesmo AP; isto cobre o AP que sumiu de vez, girando entre
+    // as redes salvas. autoConnect() nao serve aqui: bloqueia ate 8s POR rede.
+    void maintain() {
+        if (WiFi.status() == WL_CONNECTED) { _retryAt = 0; _retryIdx = 0; return; }
+        if (_count == 0) return;
+        uint32_t now = millis();
+        // Primeiro carimbo: janela de graca. O autoReconnect do core ja esta
+        // tentando; entrar por cima dele so rende "sta is connecting, cannot set
+        // config" e aborta a tentativa que estava em curso.
+        if (_retryAt == 0) { _retryAt = now + 30000; return; }
+        if ((int32_t)(now - _retryAt) < 0) return;
+        Serial.printf("WiFi: reconnect '%s'\n", _nets[_retryIdx].ssid);
+        WiFi.disconnect(false, false);   // sai do estado "connecting" senao begin() e recusado
+        WiFi.begin(_nets[_retryIdx].ssid, _nets[_retryIdx].pass);
+        _retryIdx = (_retryIdx + 1) % _count;
+        _retryAt = now + 20000;
     }
 
     // Tenta cada rede salva até uma conectar.
@@ -130,6 +154,8 @@ private:
     };
     SavedNet _nets[MAX_SAVED_NETWORKS];
     int _count = 0;
+    uint32_t _retryAt = 0;
+    int _retryIdx = 0;
 
     void _loadAll() {
         _count = _prefs.getInt("count", 0);

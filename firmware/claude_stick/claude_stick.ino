@@ -205,14 +205,48 @@ static void moment_close();
 // ============================================================
 // Pipeline de display/touch (validado no bring-up)
 // ============================================================
+// Modo DIRECT: `px_map` e sempre o framebuffer inteiro e `area` e so o retangulo
+// sujo. Transpor apenas essa area corta o grosso do custo — antes eram 153.600
+// pixels em PSRAM a cada piscada de mascote ou label de 1s.
+// A escrita anda contigua no destino (lx fixo => ly consecutivos sao vizinhos em
+// canvas_fb), que e o lado que mais sofre com cache miss em PSRAM.
+// O push QSPI (307KB) so acontece no ultimo retangulo do refresh; sem essa
+// guarda o LVGL dispararia um push por area suja.
+#define FLUSH_STATS 0        // 1 = loga custo de flush 1x/s no serial
+
 static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map) {
-  uint16_t *src = (uint16_t *)px_map;
-  for (int ly = 0; ly < SCREEN_HEIGHT; ly++) {
-    uint16_t *src_row = src + ly * SCREEN_WIDTH;
-    for (int lx = 0; lx < SCREEN_WIDTH; lx++)
-      canvas_fb[(479 - lx) * 320 + ly] = src_row[lx];
+  const uint16_t *src = (const uint16_t *)px_map;
+  const int y1 = area->y1, y2 = area->y2;
+#if FLUSH_STATS
+  uint32_t t0 = micros();
+#endif
+  for (int lx = area->x1; lx <= area->x2; lx++) {
+    uint16_t *dst = canvas_fb + (479 - lx) * 320 + y1;
+    const uint16_t *s = src + (size_t)y1 * SCREEN_WIDTH + lx;
+    for (int ly = y1; ly <= y2; ly++) { *dst++ = *s; s += SCREEN_WIDTH; }
   }
-  gfx->flush();
+#if FLUSH_STATS
+  uint32_t t1 = micros();
+#endif
+  bool last = lv_display_flush_is_last(disp);
+  if (last) gfx->flush();
+#if FLUSH_STATS
+  uint32_t t2 = micros();
+
+  // Custo de transpor vs empurrar por QSPI. Medido: push = 40,3ms fixos (canvas
+  // inteiro), transposicao = 0,11us/px. Ligar so quando for medir de novo.
+  static uint32_t accT = 0, accP = 0, px = 0, frames = 0, rects = 0, at = 0;
+  accT += t1 - t0; accP += t2 - t1; rects++;
+  px += (uint32_t)(area->x2 - area->x1 + 1) * (area->y2 - area->y1 + 1);
+  if (last) frames++;
+  if (millis() - at > 1000) {
+    at = millis();
+    Serial.printf("[FPS] frames=%u rects=%u px/s=%u transp=%uus push=%uus\n",
+                  (unsigned)frames, (unsigned)rects, (unsigned)px,
+                  (unsigned)accT, (unsigned)accP);
+    accT = accP = px = frames = rects = 0;
+  }
+#endif
   lv_disp_flush_ready(disp);
 }
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
@@ -2517,6 +2551,19 @@ static void ensure_time() {
   Serial.println("[NTP] sync iniciado");
 }
 
+// Heap livre + maior bloco contiguo. O handshake TLS precisa de ~45KB contiguos:
+// heap total alto com maior bloco pequeno (fragmentacao) da o mesmo http_-1.
+static void log_mem(const char *tag) {
+  lv_mem_monitor_t m;
+  lv_mem_monitor(&m);
+  Serial.printf("[MEM] %s heap=%u maior=%u psram=%u lvgl=%u/%u frag=%u%%\n", tag,
+                (unsigned)ESP.getFreeHeap(),
+                (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
+                (unsigned)ESP.getFreePsram(),
+                (unsigned)(m.total_size - m.free_size), (unsigned)m.total_size,
+                (unsigned)m.frag_pct);
+}
+
 // Sonda o próximo modelo da rotação.
 static void probe_next_model() {
   int mi = g_probeIdx % NMODELS;
@@ -2530,11 +2577,17 @@ static void do_refresh() {
   ensure_time();
   bool ok = fetchUsage(g_token, g_usage);
   if (ok) {
-    fetchModelStatus(g_status); g_lastOkMs = millis(); g_lastFetchOk = true;
+    g_lastOkMs = millis(); g_lastFetchOk = true;
     hist_push(g_usage.h5, g_usage.d7); accumulate_heat(g_usage.h5); save_history();
     check_thresholds();
     probe_next_model();
-  } else g_lastFetchOk = false;
+    // Fechar o TLS da API ANTES do status: sao hosts diferentes, dois contextos
+    // mbedTLS vivos ao mesmo tempo (~45KB cada) esgotam a heap e o driver WiFi
+    // derruba a conexao.
+    apiClose();
+    fetchModelStatus(g_status);
+  } else { g_lastFetchOk = false; apiClose(); }
+  log_mem("refresh");
   g_lastPollMs = millis();
   request_state(ok ? ST_MAIN : ST_ERROR);
 }
@@ -2543,7 +2596,9 @@ static void do_refresh() {
 // antigos se falhar. A chamada à API é bloqueante (~1-2s), então mostra
 // "atualizando..." no cabeçalho durante a busca.
 static void bg_refresh() {
-  if (!g_wifi.isConnected()) g_wifi.autoConnect(WIFI_CONNECT_TIMEOUT_MS);
+  // Sem WiFi nao se tenta reconectar aqui: autoConnect() bloqueia ate 8s POR rede
+  // salva (24s) com o LVGL parado. Quem reconecta e o g_wifi.maintain() do loop().
+  if (!g_wifi.isConnected()) { g_lastFetchOk = false; g_lastPollMs = millis(); return; }
   ensure_time();
   g_refreshing = true; set_hdr_status(); lv_refr_now(NULL);
   UsageData u = {};
@@ -2555,11 +2610,13 @@ static void bg_refresh() {
     check_thresholds();
     int moodBefore[NMODELS];
     for (int i = 0; i < NMODELS; i++) moodBefore[i] = model_mood(i);
-    fetchModelStatus(g_status);
     probe_next_model();
+    apiClose();                 // libera o contexto TLS antes de falar com outro host
+    fetchModelStatus(g_status);
     for (int i = 0; i < NMODELS; i++)
       if (moodBefore[i] != model_mood(i)) rebuild = true;   // mascote muda de humor
-  } else g_lastFetchOk = false;
+  } else { g_lastFetchOk = false; apiClose(); }
+  log_mem("bg_refresh");
   g_refreshing = false;
   g_lastPollMs = millis();
   if (rebuild) request_state(ST_MAIN);    // mascotes mudaram -> rebuild
@@ -2594,7 +2651,10 @@ void setup() {
   if (!buf) { Serial.println("FATAL PSRAM"); fatal_screen("PSRAM indisponivel"); }
   lv_display_t *disp = lv_display_create(SCREEN_WIDTH, SCREEN_HEIGHT);
   lv_display_set_flush_cb(disp, disp_flush_cb);
-  lv_display_set_buffers(disp, buf, NULL, bufSize, LV_DISPLAY_RENDER_MODE_FULL);
+  // DIRECT (nao FULL): o LVGL redesenha so o que mudou dentro do buffer cheio e
+  // entrega o retangulo sujo ao flush_cb. Em FULL, qualquer animacao de 1 pixel
+  // custava um render + transposicao de tela inteira.
+  lv_display_set_buffers(disp, buf, NULL, bufSize, LV_DISPLAY_RENDER_MODE_DIRECT);
   lv_indev_t *indev = lv_indev_create();
   lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
   lv_indev_set_read_cb(indev, touch_read_cb);
@@ -2638,6 +2698,9 @@ void setup() {
 
 void loop() {
   lv_task_handler();
+  // Reconexao nao bloqueante (~15s entre tentativas). Fora da tela de WiFi, que
+  // faz scan e connect proprios — um begin() por baixo atrapalharia.
+  if (g_state != ST_WIFI) g_wifi.maintain();
 
   // Servidor web (token no onboarding; /window + /tokens no dashboard)
   if (g_web) {
@@ -2664,6 +2727,14 @@ void loop() {
       (g_wantRefresh || millis() - g_lastPollMs > (uint32_t)g_pollSec * 1000)) {
     g_wantRefresh = false;
     bg_refresh();           // seta g_lastPollMs no fim
+  }
+
+  // ST_ERROR nao tem saida propria: quem cai la (tipico: boot mais rapido que o
+  // WiFi) ficava preso na tela de falha ate desligar da tomada. Tenta de novo
+  // assim que houver rede.
+  if (g_state == ST_ERROR && g_wifi.isConnected() && millis() - g_lastPollMs > 15000) {
+    g_lastPollMs = millis();
+    request_state(ST_LOADING);
   }
 
   // Atualização viva: contadores (1s), barra de refresh (250ms), mascotes,
