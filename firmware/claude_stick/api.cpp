@@ -26,10 +26,8 @@ static const char* RL_HEADERS[] = {
 static const int RL_HEADER_COUNT = 12;
 
 
-// Cliente TLS compartilhado entre fetchUsage() e probeModel(). O handshake
-// completo (verificacao da cadeia RSA) custa ~1-2s no ESP32-S3; com keep-alive
-// so a primeira requisicao de cada sessao paga esse preco. Reinstanciar um
-// WiFiClientSecure por chamada tambem realocava ~40KB de heap a cada poll.
+// Cliente TLS persistente. Reinstanciar um WiFiClientSecure por chamada
+// realocava ~40KB de heap a cada poll.
 static WiFiClientSecure& apiClient() {
     static WiFiClientSecure c;
     static bool ready = false;
@@ -148,21 +146,4 @@ bool fetchUsage(const char* token, UsageData& out) {
     g_api.end();
     out.ok = true;
     return true;
-}
-
-bool probeModel(const char* token, const char* modelId, ProbeResult& out) {
-    String body = String("{\"model\":\"") + modelId + "\","
-                  "\"max_tokens\":1,"
-                  "\"messages\":[{\"role\":\"user\",\"content\":\".\"}]}";
-
-    uint32_t t0 = millis();
-    int code = apiPost(token, body, false);
-    uint32_t dt = millis() - t0;
-    if (code > 0) g_api.getString();   // drena p/ manter o keep-alive saudavel
-    g_api.end();
-
-    out.code = code;
-    out.ms = (dt > 65000) ? 65000 : (uint16_t)dt;
-    Serial.printf("[PROBE] %s -> HTTP %d (%ums)\n", modelId, code, (unsigned)dt);
-    return code == 200;
 }

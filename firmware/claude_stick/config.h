@@ -33,9 +33,8 @@
 
 // ── Polling ──────────────────────────────────────────────
 #define DEFAULT_POLL_SEC        120
-#define MIN_POLL_SEC            30
+#define MIN_POLL_SEC            15
 #define MAX_POLL_SEC            300
-#define STATUS_POLL_SEC         300      // status.claude.com a cada 5 min
 
 // ── Segurança (PIN + AES-256-GCM) ────────────────────────
 #define PIN_LEN                 4
@@ -45,13 +44,12 @@
 
 // ── Rede / API Claude ────────────────────────────────────
 #define WIFI_CONNECT_TIMEOUT_MS 8000
+#define WIFI_REBOOT_AFTER_MS    180000   // offline ha 3 min: reboot (AP some do scan; so reboot recupera)
 #define WIFI_COUNTRY_CODE       "BR"     // canais 1-13; "US" = 1-11, "JP" = 1-14
 #define API_TIMEOUT_MS          15000
 #define MESSAGES_ENDPOINT       "https://api.anthropic.com/v1/messages"
 #define ANTHROPIC_VERSION       "2023-06-01"
 #define PROBE_MODEL             "claude-haiku-4-5-20251001"
-// status.anthropic.com redireciona para cá — consultar o host canônico direto
-#define STATUS_ENDPOINT         "https://status.claude.com/api/v2/incidents/unresolved.json"
 
 // NTP (necessário para os contadores de reset)
 #define NTP_SERVER_1            "pool.ntp.org"

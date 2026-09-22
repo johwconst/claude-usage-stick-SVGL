@@ -113,6 +113,9 @@ public:
 
     int scanNetworks(NetworkInfo *results, int max_results) {
         int n = WiFi.scanNetworks();
+        Serial.printf("WiFi: scan -> %d redes\n", n);
+        for (int i = 0; i < n; i++)
+            Serial.printf("  ch%2d %4d dBm  %s\n", (int)WiFi.channel(i), (int)WiFi.RSSI(i), WiFi.SSID(i).c_str());
         int count = min(n, max_results);
         for (int i = 0; i < count; i++) {
             strncpy(results[i].ssid, WiFi.SSID(i).c_str(), 32);
@@ -173,11 +176,16 @@ private:
     int _retryIdx = 0;
 
     // Liga o STA com pais BR (canais 1-13). O default do IDF e "01" (1-11): AP
-    // no canal 12/13 so era achado por sorte via 802.11d -> NO_AP_FOUND (201)
-    // em loop. Reaplicar a cada mode(WIFI_STA): o mode(WIFI_OFF) desfaz.
+    // no canal 12/13 nao aparece no scan -> NO_AP_FOUND (201) em loop.
+    // 802.11d DESLIGADO de proposito: ligado, o ESP adota o pais anunciado no
+    // beacon dos APs vizinhos (ex.: "US", 1-11) e perde o canal 13 de novo.
+    // Reaplicar a cada mode(WIFI_STA): o mode(WIFI_OFF) desfaz.
     static void _radioOn() {
         WiFi.mode(WIFI_STA);
-        esp_wifi_set_country_code(WIFI_COUNTRY_CODE, true);
+        esp_err_t e = esp_wifi_set_country_code(WIFI_COUNTRY_CODE, false);
+        char cc[3] = {0};
+        esp_wifi_get_country_code(cc);
+        Serial.printf("WiFi: pais=%s (%s)\n", cc, esp_err_to_name(e));
     }
 
     void _loadAll() {

@@ -64,7 +64,7 @@ If you're comfortable with a terminal, skip it and use [Build & flash](#build--f
 
 > The images below are **pixel-accurate mockups** rendered from the firmware's own layout and
 > palette (real device photos coming soon) — regenerate with `python3 tools/gen_mockups.py`. They
-> match v2.2, except that the four swipe screens do not yet show the `@label` account badge that
+> match v2.2, except that the three swipe screens do not yet show the `@label` account badge that
 > appears in the header once you add a second account.
 
 Navigate by **swiping** (the dots at the bottom show your position; the active one becomes a
@@ -84,18 +84,7 @@ next refresh — tapping it refreshes immediately.
 
 <br clear="right">
 
-### 2. Models (*Modelos*)
-<img src="assets/mock-modelos.png" width="400" align="right" alt="Models screen">
-
-- The 4 Clawd mascots (Haiku / Sonnet / Opus / Fable) with a **live status pill** under each one,
-  fed by a **real probe against the API** (one model per refresh cycle, rotating):
-  `OK 0.9s` (green, with latency) · `LIMITADO` (amber, HTTP 429) · `ERRO` (red, 5xx/network) ·
-  `N/D` / `--` (gray). The mascot goes gray when the model is unreachable or under incident.
-- An **incident line** from `status.claude.com` (is the problem you or Anthropic?).
-
-<br clear="right">
-
-### 3. 5-hour window (*Janela de 5h*)
+### 2. 5-hour window (*Janela de 5h*)
 <img src="assets/mock-janela5h.png" width="400" align="right" alt="5-hour window screen">
 
 - Custom chart with the **X axis spanning exactly the current 5 h window** (start → reset).
@@ -105,7 +94,7 @@ next refresh — tapping it refreshes immediately.
 
 <br clear="right">
 
-### 4. Hourly rhythm (*Ritmo por hora*)
+### 3. Hourly rhythm (*Ritmo por hora*)
 <img src="assets/mock-ritmo.png" width="400" align="right" alt="Hourly rhythm screen">
 
 - **Usage by hour of day**: 24 bars whose height/brightness show which hours burn the most quota;
@@ -136,7 +125,8 @@ The header and the token/loading screens use the **official Claude Code pixel lo
 Opened from the gear (scrollable list, 44 px touch rows):
 
 - **Refresh now** — forces a refresh.
-- **Refresh interval** — 30 s / 1 min / 2 min / 5 min (tap to cycle; saved to NVS).
+- **Refresh interval** — 15 s / 30 s / 1 min / 2 min / 5 min (tap to cycle; saved to NVS).
+- **Weekly mascot** — the WEEK card alternates on every refresh between weekly usage and an animated Clawd; tap to cycle **Clawd / rotation** (the 4 models with their accessory) **/ mood** (follows weekly usage) **/ off**.
 - **Slideshow** — auto-advances the screens; tap to cycle **off / 5 s / 10 s / 15 s / 30 s**
   (pauses for 10 s after any touch).
 - **Timezone: GMT±N** — adjusts the timezone (tap to cycle; fixes the reset clocks).
@@ -242,11 +232,6 @@ anthropic-ratelimit-unified-representative-claim  five_hour | seven_day  (what l
 anthropic-ratelimit-unified-fallback-percentage
 anthropic-ratelimit-unified-overage-status / -overage-disabled-reason
 ```
-
-Model health combines `status.claude.com/api/v2/incidents/unresolved.json` (incidents) with a
-**per-model probe**: each refresh cycle the device sends one `max_tokens: 1` request to the next
-model in the rotation (Haiku → Sonnet → Opus → Fable) and records the HTTP code + latency. That's
-what feeds the colored status pills on the Models screen.
 
 ### Tokens per session (optional bridge)
 

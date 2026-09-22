@@ -3,9 +3,9 @@
  * Placa: Guition JC4832W535 (ESP32-S3, AXS15231B QSPI), 480x320 paisagem.
  *
  * Dashboard do rate-limit do Claude Code (janelas 5h e 7d, headers unified-*),
- * sonda real por modelo (latencia + HTTP), projecao de esgotamento da janela
- * 5h e ritmo de uso por hora com filtro de periodo. Token OAuth digitado na
- * tela e guardado cifrado (AES-256-GCM, chave derivada de um PIN de 4 digitos).
+ * projecao de esgotamento da janela 5h e ritmo de uso por hora com filtro de
+ * periodo. Token OAuth digitado na tela e guardado cifrado (AES-256-GCM, chave
+ * derivada de um PIN de 4 digitos).
  *
  * Tokens por sessao: a API nao expoe contagem para conta de assinatura; um
  * bridge opcional (tools/token_bridge.py) soma os transcripts locais do
@@ -29,7 +29,6 @@
 #include "touch.h"
 #include "wifi_manager.h"
 #include "api.h"
-#include "status.h"
 #include "crypto.h"
 #include "accounts.h"
 #include "logo_assets.h"   // Clawd + logotipo oficiais (gerado por tools/gen_logo_assets.py)
@@ -72,18 +71,6 @@ static void request_state(State s) { g_pending = s; g_dirty = true; }
 
 // ---- Dados ----
 static UsageData   g_usage = {};
-static ModelStatus g_status = {true, true, true, true, false};
-
-// ---- Modelos sondados (1 por ciclo, rotativo) ----
-#define NMODELS 4
-struct ModelInfo { const char *name; const char *id; ProbeResult pr; uint32_t atMs; };
-static ModelInfo g_models[NMODELS] = {
-  {"Haiku",  "claude-haiku-4-5-20251001", {0, 0}, 0},
-  {"Sonnet", "claude-sonnet-5",           {0, 0}, 0},
-  {"Opus",   "claude-opus-4-8",           {0, 0}, 0},
-  {"Fable",  "claude-fable-5",            {0, 0}, 0},
-};
-static int g_probeIdx = 0;
 
 // ---- Tokens por sessao (vindos do bridge via POST /tokens) ----
 struct TokenStats { long long tin, tout, cache; int sessions; uint32_t atMs; };
@@ -103,6 +90,13 @@ static char g_pendingToken[200] = {0};       // token digitado, aguardando PIN
 // g_token, entao quem consegue ler a RAM ja tem o que interessa. O que continua
 // valendo: nada disso vai para o NVS, e factory_reset() zera este buffer.
 static char g_sessionPin[PIN_LEN + 1] = {0};
+// Copia do PIN da sessao em RTC RAM: sobrevive ao ESP.restart() do watchdog de
+// WiFi (ver loop()) para o device voltar ao dashboard sem pedir PIN. Some ao
+// desligar da energia; o setup() so aceita apos reset por software.
+#define RTC_PIN_MAGIC 0xC1A0DE01u
+struct RtcSession { uint32_t magic; char pin[PIN_LEN + 1]; };
+RTC_NOINIT_ATTR static RtcSession g_rtc;
+static void rtc_session_clear() { memset(&g_rtc, 0, sizeof(g_rtc)); }
 static int  g_tokenTargetSlot = 0;
 static char g_pendingLabel[ACCT_LBL_MAX] = {0};
 static char g_pinEntry[PIN_LEN + 1] = {0};   // dígitos sendo digitados
@@ -128,6 +122,9 @@ static int g_briIdx = 1;
 static uint32_t g_lastPollMs = 0;         // millis do último poll (p/ barra de refresh)
 static int g_pollSec = DEFAULT_POLL_SEC;  // intervalo de atualização (config, NVS)
 static int g_tzOffset = -3;               // fuso GMT (horas), config NVS
+static int g_weekMasc = 1;                // card SEMANA: 0=off 1=Clawd 2=rodizio 3=humor (NVS)
+static bool g_weekFlip = false;           // face atual do card SEMANA (vira a cada poll)
+static int g_rotIdx = 0;                  // proximo modelo do rodizio
 static int g_slideSec = 0;                // slideshow: 0=off, 5/10/15/30s (config, NVS)
 static int g_heatMode = 3;                // 0=hoje 1=7d 2=30d 3=tudo (config, NVS)
 static uint32_t g_lastTouchMs = 0;        // ultimo toque (pausa o slideshow)
@@ -148,15 +145,25 @@ struct DayHeat { uint32_t day; float burn[24]; };   // day = dias locais desde e
 static DayHeat g_days[NDAYS];
 static int g_dayN = 0;
 
-// ---- Mascotes Clawd oficiais (pagina de modelos; humor por status) ----
-// mood: 0=nunca sondado, 1=ok, 2=limitado(429), 3=erro/incidente, 4=n/d(404)
-struct Mascot { lv_obj_t *cont, *img, *lid[2], *drop; int baseY, mood; };
+// ---- Mascotes Clawd oficiais por modelo (reservado p/ uso futuro) ----
+// Sem tela propria hoje: g_mascN fica 0 e a animacao do loop() nao roda.
+// mood: 0=apagado, 1=ok, 2=limitado, 3=erro, 4=dormindo
+#define NMODELS 4                     // 0=Haiku 1=Sonnet 2=Opus 3=Fable
+struct Mascot {
+  lv_obj_t *cont, *img, *lid[2], *drop, *pupil[2], *fx[3];   // fx: particulas do humor
+  int baseX, baseY, mood, scale;                             // scale: 256 = 1x
+  uint32_t bornMs, lookAt, lookUntil;                        // pulinho / olhar p/ os lados
+};
+#define MASC_TICK_MS 40                 // ~25 fps; se o touch pesar, voltar p/ 60-80
+// prototipos explicitos: o gerador do Arduino poria os automaticos antes do struct
+static void masc_scale(Mascot &m, float sx, float sy);
+static void masc_tick(Mascot &m, uint32_t now, int i);
 static Mascot g_masc[NMODELS];
 static int g_mascN = 0;
 static lv_point_precise_t g_mXPts[NMODELS][4][2];   // olhos em X (mood 3)
 
 // ---- Ponteiros de UI do dashboard (zerados a cada build de ST_MAIN) ----
-#define NTILES 4
+#define NTILES 3
 #define NSEG 18                       // segmentos do medidor de janela
 struct DashUI {
   lv_obj_t *tv, *tile[NTILES], *dots[NTILES];
@@ -165,8 +172,7 @@ struct DashUI {
   lv_obj_t *agChip, *agPct5, *agCd5, *agAt5;
   lv_obj_t *agPct7, *agCd7, *agAt7, *agTok;
   lv_obj_t *seg5[NSEG], *seg7[NSEG];  // medidores segmentados
-  // modelos
-  lv_obj_t *mChip[NMODELS], *incident;
+  lv_obj_t *wkMasc;                   // face "mascote" do card SEMANA
   // tendência da janela 5h (linhas custom)
   lv_obj_t *trHist, *trProj, *trDot, *trCap, *trT0, *trT1;
   // ritmo por hora
@@ -367,6 +373,8 @@ static void load_persisted() {
   g_tzOffset = g_prefs.getInt("tz", -3);
   if (g_tzOffset < -12 || g_tzOffset > 14) g_tzOffset = -3;
   g_slideSec = g_prefs.getInt("slide", 0);
+  g_weekMasc = g_prefs.getInt("wmasc", 1);
+  if (g_weekMasc < 0 || g_weekMasc > 3) g_weekMasc = 1;
   if (g_slideSec != 0 && g_slideSec != 5 && g_slideSec != 10 &&
       g_slideSec != 15 && g_slideSec != 30) g_slideSec = 0;
   g_heatMode = g_prefs.getInt("heatm", 3);
@@ -1316,19 +1324,6 @@ static lv_obj_t *rrect(lv_obj_t *p, int x, int y, int w, int h, int r, uint32_t 
   lv_obj_clear_flag(o, LV_OBJ_FLAG_SCROLLABLE);
   return o;
 }
-// humor do modelo: sonda real (HTTP) + incidentes do status.claude.com
-static int model_mood(int i) {
-  bool inc = (i == 0) ? g_status.haikuUp : (i == 1) ? g_status.sonnetUp
-           : (i == 2) ? g_status.opusUp  : g_status.fableUp;
-  int c = g_models[i].pr.code;
-  if (!inc) return 3;
-  if (c == 0) return 0;
-  if (c == 200) return 1;
-  if (c == 429) return 2;
-  if (c == 404) return 4;
-  return 3;                              // rede / 5xx / auth
-}
-
 // adereço pixel que identifica cada modelo (flutuando sobre a cabeça)
 static void build_accessory(lv_obj_t *c, int model) {
   switch (model) {
@@ -1355,11 +1350,10 @@ static void build_accessory(lv_obj_t *c, int model) {
   }
 }
 
-// Mascote da pagina de modelos: Clawd oficial + humor + adereço.
-static void build_model_mascot(lv_obj_t *parent, int cx, int i) {
-  if (g_mascN >= NMODELS) return;
-  int mood = model_mood(i);
-  int baseY = 14;
+// Mascote Clawd oficial + humor + adereço. i = modelo (0..3; -1 = Clawd puro,
+// sem adereço), mood = ver g_masc. Retorna o container (88x80).
+static lv_obj_t *build_model_mascot(lv_obj_t *parent, int cx, int baseY, int i, int mood) {
+  if (g_mascN >= NMODELS) return nullptr;
   lv_obj_t *c = lv_obj_create(parent);
   lv_obj_set_pos(c, cx - 44, baseY); lv_obj_set_size(c, 88, 80);
   lv_obj_set_style_bg_opa(c, 0, 0); lv_obj_set_style_border_width(c, 0, 0);
@@ -1375,28 +1369,44 @@ static void build_model_mascot(lv_obj_t *parent, int cx, int i) {
   const int ey = CLAWD_MD_EYE0_Y + 20, ew = CLAWD_MD_EYE0_W, eh = CLAWD_MD_EYE0_H;
 
   Mascot &m = g_masc[g_mascN];
-  m.cont = c; m.img = img; m.baseY = baseY; m.mood = mood;
-  m.lid[0] = m.lid[1] = nullptr; m.drop = nullptr;
+  memset(&m, 0, sizeof(m));
+  m.cont = c; m.img = img; m.baseX = cx - 44; m.baseY = baseY; m.mood = mood; m.scale = 256;
+  m.bornMs = millis(); m.lookAt = m.bornMs + 2500;
 
+  const int xi = i < 0 ? 0 : i;          // slot de g_mXPts
   if (mood == 1) {                       // ok: pálpebras escondidas p/ piscar
     for (int k = 0; k < 2; k++) {
       m.lid[k] = rrect(c, ex[k] - 1, ey - 1, ew + 2, eh + 2, 1, C_ACCENT);
       lv_obj_add_flag(m.lid[k], LV_OBJ_FLAG_HIDDEN);
     }
+    // pupilas p/ olhar de lado: o olho do bitmap e furo transparente (mostra o
+    // fundo do card), entao a pupila e da cor do fundo sobre a palpebra
+    for (int k = 0; k < 2; k++) {
+      m.pupil[k] = rrect(c, ex[k], ey, ew, eh, 1, C_SURFACE);
+      lv_obj_add_flag(m.pupil[k], LV_OBJ_FLAG_HIDDEN);
+    }
+    for (int k = 0; k < 3; k++) {        // brilhos "+" subindo
+      lv_obj_t *sp = rrect(c, 18 + k * 24, 16, 6, 6, 0, 0);
+      lv_obj_set_style_bg_opa(sp, 0, 0);
+      rrect(sp, 2, 0, 2, 6, 0, C_WARN);
+      rrect(sp, 0, 2, 6, 2, 0, C_WARN);
+      m.fx[k] = sp;
+    }
   } else if (mood == 2) {                // limitado: gota de suor
     m.drop = rrect(c, 70, 24, 6, 10, 3, 0x7DD3FC);
+    m.fx[0] = rrect(c, 12, 24, 5, 8, 3, 0x7DD3FC);   // 2a gota, do outro lado
   } else if (mood == 3) {                // erro/incidente: cinza + olhos em X
     lv_obj_set_style_image_recolor(img, lv_color_hex(0x6A6A74), 0);
     lv_obj_set_style_image_recolor_opa(img, 190, 0);
     lv_obj_set_y(img, 24);               // caidinho
     for (int k = 0; k < 2; k++) {
-      g_mXPts[i][k * 2][0]     = { (lv_value_precise_t)(ex[k] - 2), (lv_value_precise_t)(ey + 2) };
-      g_mXPts[i][k * 2][1]     = { (lv_value_precise_t)(ex[k] + ew + 2), (lv_value_precise_t)(ey + eh + 6) };
-      g_mXPts[i][k * 2 + 1][0] = { (lv_value_precise_t)(ex[k] + ew + 2), (lv_value_precise_t)(ey + 2) };
-      g_mXPts[i][k * 2 + 1][1] = { (lv_value_precise_t)(ex[k] - 2), (lv_value_precise_t)(ey + eh + 6) };
+      g_mXPts[xi][k * 2][0]     = { (lv_value_precise_t)(ex[k] - 2), (lv_value_precise_t)(ey + 2) };
+      g_mXPts[xi][k * 2][1]     = { (lv_value_precise_t)(ex[k] + ew + 2), (lv_value_precise_t)(ey + eh + 6) };
+      g_mXPts[xi][k * 2 + 1][0] = { (lv_value_precise_t)(ex[k] + ew + 2), (lv_value_precise_t)(ey + 2) };
+      g_mXPts[xi][k * 2 + 1][1] = { (lv_value_precise_t)(ex[k] - 2), (lv_value_precise_t)(ey + eh + 6) };
       for (int l = 0; l < 2; l++) {
         lv_obj_t *ln = lv_line_create(c);
-        lv_line_set_points(ln, g_mXPts[i][k * 2 + l], 2);
+        lv_line_set_points(ln, g_mXPts[xi][k * 2 + l], 2);
         lv_obj_set_style_line_width(ln, 3, 0);
         lv_obj_set_style_line_color(ln, lv_color_hex(C_BAD), 0);
         lv_obj_set_style_line_rounded(ln, true, 0);
@@ -1411,27 +1421,18 @@ static void build_model_mascot(lv_obj_t *parent, int cx, int i) {
   } else {                               // nunca sondado: apagadinho
     lv_obj_set_style_opa(c, 140, 0);
   }
+  if (mood == 3) m.fx[0] = rrect(c, 37, 2, 14, 8, 4, 0x6A6A74);   // nuvenzinha
   g_mascN++;
-}
-
-static void model_chip(int i, char *out, size_t sz, uint32_t *col) {
-  int c = g_models[i].pr.code;
-  if (c == 0)             { strlcpy(out, "--", sz);        *col = C_MUTED; }
-  else if (c == 200)      { snprintf(out, sz, "OK %.1fs", g_models[i].pr.ms / 1000.0f); *col = C_OK; }
-  else if (c == 429)      { strlcpy(out, TRS("LIMITADO", "LIMITED"), sz); *col = C_WARN; }
-  else if (c == 404)      { strlcpy(out, TRS("N/D", "N/A"), sz); *col = C_MUTED; }
-  else if (c == 401 || c == 403) { strlcpy(out, "AUTH", sz); *col = C_BAD; }
-  else if (c < 0)         { strlcpy(out, TRS("REDE", "NET"), sz); *col = C_BAD; }
-  else                    { snprintf(out, sz, TRS("ERRO %d", "ERR %d"), c); *col = C_BAD; }
+  return c;
 }
 
 // ============================================================
-// Builders dos 4 tiles
+// Builders dos 3 tiles
 // ============================================================
 // Tile 0 — AGORA: janelas 5h/semana com % grande, medidor segmentado
 // (verde -> vermelho conforme o uso) e countdown grande.
-static void build_win_card(lv_obj_t *t, int x, const char *title,
-                           lv_obj_t **pct, lv_obj_t **seg, lv_obj_t **at, lv_obj_t **cd) {
+static lv_obj_t *build_win_card(lv_obj_t *t, int x, const char *title,
+                                lv_obj_t **pct, lv_obj_t **seg, lv_obj_t **at, lv_obj_t **cd) {
   lv_obj_t *c = card(t, x, 4, 228, 210);
   tstatic(c, title, &lv_font_montserrat_14, C_MUTED, 0, 0);
   *pct = tlabel(c, &lv_font_montserrat_48, C_OK, 0, 20);
@@ -1439,35 +1440,58 @@ static void build_win_card(lv_obj_t *t, int x, const char *title,
     seg[i] = rrect(c, i * 11, 82, 8, 16, 2, C_TRACK);
   *at = tlabel(c, &lv_font_montserrat_12, C_FAINT, 0, 106);
   *cd = tlabel(c, &lv_font_montserrat_40, C_TEXT, 0, 124);
+  return c;
+}
+
+// Face alternativa do card SEMANA: mascote Clawd animado. Alterna com o consumo
+// semanal a cada poll (g_weekFlip, virado no bg_refresh). Painel opaco por cima
+// do conteudo do card; reconstruido a cada aparicao (rodizio/humor mudam).
+static void week_face_apply() {
+  lv_obj_t *p = g_ui.wkMasc;
+  if (!p) return;
+  if (!g_weekMasc || !g_weekFlip) { lv_obj_add_flag(p, LV_OBJ_FLAG_HIDDEN); return; }
+  lv_obj_clean(p);
+  g_mascN = 0;                           // unico dono de g_masc hoje
+  static const char *NAMES[NMODELS] = {"HAIKU", "SONNET", "OPUS", "FABLE"};
+  int model = -1, mood = 1;
+  char title[32] = "CLAWD";
+  if (g_weekMasc == 2) {                 // rodizio dos 4 modelos
+    model = g_rotIdx++ % NMODELS;
+    strlcpy(title, NAMES[model], sizeof(title));
+  } else if (g_weekMasc == 3) {          // humor pelo uso semanal
+    float d = g_usage.d7;
+    mood = d < 70 ? 1 : (d < 90 ? 2 : 3);
+    snprintf(title, sizeof(title), "CLAWD \xE2\x80\xA2 %d%%", (int)(d + 0.5f));
+  }
+  tstatic(p, title, &lv_font_montserrat_14, C_MUTED, 0, 0);
+  // area util 200x182 (card 228x210, pad 14); centro do mascote em (100, 104)
+  lv_obj_t *m = build_model_mascot(p, 100, 104 - 40, model, mood);
+  if (m) {
+    // ponytail: escala via transform = render em layer; se pesar, voltar p/ 1x
+    lv_obj_set_style_transform_pivot_x(m, 44, 0);
+    lv_obj_set_style_transform_pivot_y(m, 40, 0);
+    lv_obj_set_style_transform_scale(m, 460, 0);   // 256 = 1x
+    g_masc[g_mascN - 1].scale = 460;               // base da respiracao/achatamento
+  }
+  lv_obj_clear_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
 static void build_tile_agora(lv_obj_t *t) {
   build_win_card(t, 8,   TRS("5 HORAS", "5 HOURS"), &g_ui.agPct5, g_ui.seg5, &g_ui.agAt5, &g_ui.agCd5);
-  build_win_card(t, 244, TRS("SEMANA", "WEEK"),     &g_ui.agPct7, g_ui.seg7, &g_ui.agAt7, &g_ui.agCd7);
+  lv_obj_t *wk = build_win_card(t, 244, TRS("SEMANA", "WEEK"), &g_ui.agPct7, g_ui.seg7, &g_ui.agAt7, &g_ui.agCd7);
+  lv_obj_t *p = lv_obj_create(wk);
+  lv_obj_set_pos(p, 0, 0); lv_obj_set_size(p, 200, 182);
+  lv_obj_set_style_bg_color(p, lv_color_hex(C_SURFACE), 0);
+  lv_obj_set_style_bg_opa(p, LV_OPA_COVER, 0);
+  lv_obj_set_style_border_width(p, 0, 0); lv_obj_set_style_radius(p, 0, 0);
+  lv_obj_set_style_pad_all(p, 0, 0); lv_obj_clear_flag(p, LV_OBJ_FLAG_SCROLLABLE);
+  g_ui.wkMasc = p;
+  week_face_apply();
   g_ui.agChip = mkchip(t, 8, 220);
   g_ui.agTok = tlabel(t, &lv_font_montserrat_12, C_MUTED, 130, 226);
   lv_obj_set_width(g_ui.agTok, 342);
   lv_obj_set_style_text_align(g_ui.agTok, LV_TEXT_ALIGN_RIGHT, 0);
 }
-// Tile 1 — MODELOS: Clawd oficial por modelo (humor animado) + sonda + incidentes.
-static void build_tile_models(lv_obj_t *t) {
-  static const int CENTERS[NMODELS] = {60, 180, 300, 420};
-  for (int i = 0; i < NMODELS; i++) {
-    build_model_mascot(t, CENTERS[i], i);
-    lv_obj_t *n = mklabel(t, g_models[i].name, &lv_font_montserrat_16,
-                          model_mood(i) == 1 ? C_TEXT : C_MUTED);
-    lv_obj_set_width(n, 104);
-    lv_obj_set_style_text_align(n, LV_TEXT_ALIGN_CENTER, 0);
-    lv_obj_set_pos(n, CENTERS[i] - 52, 98);
-    g_ui.mChip[i] = mkchip(t, 0, 122);
-  }
-  tstatic(t, TRS("sonda real na API \xE2\x80\xA2 1 modelo por ciclo",
-                 "live API probe \xE2\x80\xA2 1 model per cycle"),
-          &lv_font_montserrat_12, C_FAINT, 14, 170);
-  g_ui.incident = tlabel(t, &lv_font_montserrat_14, C_MUTED, 14, 194);
-  lv_obj_set_width(g_ui.incident, 452);
-  lv_label_set_long_mode(g_ui.incident, LV_LABEL_LONG_WRAP);
-}
-// Tile 2 — JANELA 5H: histórico + projeção pontilhada até esgotar.
+// Tile 1 — JANELA 5H: histórico + projeção pontilhada até esgotar.
 #define TR_X0 12
 #define TR_Y0 10
 #define TR_W  440
@@ -1525,7 +1549,7 @@ static void build_tile_trend(lv_obj_t *t) {
   lv_obj_set_width(g_ui.trCap, 452);
   lv_label_set_long_mode(g_ui.trCap, LV_LABEL_LONG_WRAP);
 }
-// Tile 3 — RITMO: heatmap por hora com filtro de período.
+// Tile 2 — RITMO: heatmap por hora com filtro de período.
 static void heat_btn_style() {
   const char *names[4] = {TRS("Hoje", "Today"), "7d", "30d", TRS("Tudo", "All")};
   for (int i = 0; i < 4; i++) {
@@ -1975,27 +1999,6 @@ static void refresh_ui_values() {
   set_chip(g_ui.agChip, overall_label(g_usage.statusOverall), status_color(g_usage.statusOverall));
   update_tok_row();
 
-  // Modelos: chips de sonda + incidente
-  for (int i = 0; i < NMODELS; i++) {
-    if (!g_ui.mChip[i]) continue;
-    char txt[16]; uint32_t col;
-    model_chip(i, txt, sizeof(txt), &col);
-    set_chip(g_ui.mChip[i], txt, col);
-    lv_obj_update_layout(g_ui.mChip[i]);
-    static const int CENTERS[NMODELS] = {60, 180, 300, 420};
-    lv_obj_set_x(g_ui.mChip[i], CENTERS[i] - lv_obj_get_width(g_ui.mChip[i]) / 2);
-  }
-  if (g_ui.incident) {
-    bool any = !(g_status.haikuUp && g_status.sonnetUp && g_status.opusUp && g_status.fableUp);
-    lv_label_set_text(g_ui.incident,
-        !g_status.ok ? TRS("status.claude.com: sem dados", "status.claude.com: no data")
-        : (any ? TRS("Incidente ativo \xE2\x80\xA2 veja status.claude.com",
-                     "Active incident \xE2\x80\xA2 see status.claude.com")
-               : TRS("status.claude.com: OK \xE2\x80\xA2 sem incidentes",
-                     "status.claude.com: OK \xE2\x80\xA2 no incidents")));
-    lv_obj_set_style_text_color(g_ui.incident, lv_color_hex(any ? C_WARN : C_FAINT), 0);
-  }
-
   trend_redraw();
   heat_redraw();
   dash_tick();
@@ -2110,9 +2113,8 @@ static void ui_main() {
     tile_setup(g_ui.tile[i]);
   }
   build_tile_agora(g_ui.tile[0]);
-  build_tile_models(g_ui.tile[1]);
-  build_tile_trend(g_ui.tile[2]);
-  build_tile_heat(g_ui.tile[3]);
+  build_tile_trend(g_ui.tile[1]);
+  build_tile_heat(g_ui.tile[2]);
   lv_obj_add_event_cb(g_ui.tv, on_tile_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
   // Dots (objetos; o ativo vira pílula)
@@ -2136,9 +2138,17 @@ static void ui_main() {
 static bool g_wipeArmed = false;
 static lv_obj_t *g_briLbl = nullptr, *g_wipeLbl = nullptr, *g_pollLbl = nullptr,
                 *g_tzLbl = nullptr, *g_slideLbl = nullptr;
-static const int POLL_OPTS[4] = {30, 60, 120, 300};
+static const int POLL_OPTS[] = {15, 30, 60, 120, 300};
+#define NPOLL_OPTS (int)(sizeof(POLL_OPTS) / sizeof(POLL_OPTS[0]))
 static const int TZ_OPTS[] = {-3, -4, -5, -6, -7, -8, -2, -1, 0, 1, 2, 3};
 #define NTZ ((int)(sizeof(TZ_OPTS) / sizeof(TZ_OPTS[0])))
+
+static lv_obj_t *g_wkMascLbl = nullptr;
+static void week_masc_txt(char *out, size_t sz) {
+  const char *n[4] = {TRS("desligado", "off"), "Clawd", TRS("rodizio", "rotation"), TRS("humor", "mood")};
+  snprintf(out, sz, TRS(LV_SYMBOL_IMAGE "  Mascote semanal: %s", LV_SYMBOL_IMAGE "  Weekly mascot: %s"),
+           n[g_weekMasc]);
+}
 
 static int g_acctDelArmed = -1;
 
@@ -2175,8 +2185,8 @@ static void settings_action_cb(lv_event_t *e) {
     case 5: request_state(ST_MAIN); break;             // voltar
     case 6: {                                          // intervalo de atualização
       int idx = 0;
-      for (int i = 0; i < 4; i++) if (POLL_OPTS[i] == g_pollSec) idx = i;
-      g_pollSec = POLL_OPTS[(idx + 1) % 4];
+      for (int i = 0; i < NPOLL_OPTS; i++) if (POLL_OPTS[i] == g_pollSec) idx = i;
+      g_pollSec = POLL_OPTS[(idx + 1) % NPOLL_OPTS];
       g_prefs.putInt("poll", g_pollSec);
       if (g_pollLbl) {
         char m[40];
@@ -2224,6 +2234,11 @@ static void settings_action_cb(lv_event_t *e) {
       break;
     case 10: request_state(ST_ABOUT); break;           // sobre / about
     case 11: g_acctDelArmed = -1; request_state(ST_ACCOUNTS); break;
+    case 12:                                           // mascote semanal: Clawd -> rodizio -> humor -> off
+      g_weekMasc = (g_weekMasc + 1) % 4;
+      g_prefs.putInt("wmasc", g_weekMasc);
+      if (g_wkMascLbl) { char m[64]; week_masc_txt(m, sizeof(m)); lv_label_set_text(g_wkMascLbl, m); }
+      break;
   }
 }
 static void add_setting_row(lv_obj_t *p, const char *txt, int act, uint32_t fg, lv_obj_t **out) {
@@ -2282,6 +2297,8 @@ static void ui_settings() {
                            LV_SYMBOL_REFRESH "  Refresh now"),   0, C_TEXT, nullptr);
   add_setting_row(lst, pollTxt,                                  6, C_TEXT, &g_pollLbl);
   add_setting_row(lst, slideTxt,                                 8, C_TEXT, &g_slideLbl);
+  char wkTxt[64]; week_masc_txt(wkTxt, sizeof(wkTxt));
+  add_setting_row(lst, wkTxt,                                   12, C_TEXT, &g_wkMascLbl);
   add_setting_row(lst, TRS(LV_SYMBOL_LIST "  Idioma: Portugues",
                            LV_SYMBOL_LIST "  Language: English"), 9, C_TEXT, nullptr);
   add_setting_row(lst, tzTxt,                                    7, C_TEXT, &g_tzLbl);
@@ -2557,7 +2574,7 @@ static void render_state() {
   g_tokMsg = nullptr;
   g_nameTa = nullptr;
   g_hdrStatus = nullptr;
-  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = nullptr;
+  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = g_wkMascLbl = nullptr;
 
   lv_obj_clean(lv_screen_active());
   lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(C_BG), 0);
@@ -2605,14 +2622,6 @@ static void log_mem(const char *tag) {
                 (unsigned)m.frag_pct);
 }
 
-// Sonda o próximo modelo da rotação.
-static void probe_next_model() {
-  int mi = g_probeIdx % NMODELS;
-  g_probeIdx++;
-  probeModel(g_token, g_models[mi].id, g_models[mi].pr);
-  g_models[mi].atMs = millis();
-}
-
 // Primeiro load (mostra a tela de carregamento). Vai p/ ST_MAIN ou ST_ERROR.
 static void do_refresh() {
   ensure_time();
@@ -2621,13 +2630,8 @@ static void do_refresh() {
     g_lastOkMs = millis(); g_lastFetchOk = true;
     hist_push(g_usage.h5, g_usage.d7); accumulate_heat(g_usage.h5); save_history();
     check_thresholds();
-    probe_next_model();
-    // Fechar o TLS da API ANTES do status: sao hosts diferentes, dois contextos
-    // mbedTLS vivos ao mesmo tempo (~45KB cada) esgotam a heap e o driver WiFi
-    // derruba a conexao.
-    apiClose();
-    fetchModelStatus(g_status);
-  } else { g_lastFetchOk = false; apiClose(); }
+  } else g_lastFetchOk = false;
+  apiClose();                   // libera o contexto TLS (~40KB) entre polls
   log_mem("refresh");
   g_lastPollMs = millis();
   request_state(ok ? ST_MAIN : ST_ERROR);
@@ -2644,24 +2648,99 @@ static void bg_refresh() {
   g_refreshing = true; set_hdr_status(); lv_refr_now(NULL);
   UsageData u = {};
   bool ok = fetchUsage(g_token, u);
-  bool rebuild = false;
   if (ok) {
     g_usage = u; g_lastOkMs = millis(); g_lastFetchOk = true;
     hist_push(u.h5, u.d7); accumulate_heat(u.h5); save_history();
     check_thresholds();
-    int moodBefore[NMODELS];
-    for (int i = 0; i < NMODELS; i++) moodBefore[i] = model_mood(i);
-    probe_next_model();
-    apiClose();                 // libera o contexto TLS antes de falar com outro host
-    fetchModelStatus(g_status);
-    for (int i = 0; i < NMODELS; i++)
-      if (moodBefore[i] != model_mood(i)) rebuild = true;   // mascote muda de humor
-  } else { g_lastFetchOk = false; apiClose(); }
+  } else g_lastFetchOk = false;
+  apiClose();                   // libera o contexto TLS (~40KB) entre polls
   log_mem("bg_refresh");
   g_refreshing = false;
   g_lastPollMs = millis();
-  if (rebuild) request_state(ST_MAIN);    // mascotes mudaram -> rebuild
-  else refresh_ui_values();               // resto: in-place (preserva o tile atual)
+  refresh_ui_values();                    // in-place (preserva o tile atual)
+  g_weekFlip = !g_weekFlip;               // card SEMANA: consumo <-> mascote
+  week_face_apply();
+}
+
+// ---- Animacao dos mascotes (tick unico: um so dono de x/y/escala) ----
+static void masc_scale(Mascot &m, float sx, float sy) {
+  lv_obj_set_style_transform_scale_x(m.cont, (int32_t)(m.scale * sx), 0);
+  lv_obj_set_style_transform_scale_y(m.cont, (int32_t)(m.scale * sy), 0);
+}
+static void masc_fx_rise(lv_obj_t *o, uint32_t cyc, uint32_t per, int y0, int dy) {
+  if (!o) return;
+  lv_obj_set_y(o, y0 - (int)(cyc * dy / per));
+  lv_obj_set_style_opa(o, (lv_opa_t)(255 - cyc * 255 / per), 0);
+}
+static void masc_tick(Mascot &m, uint32_t now, int i) {
+  if (!m.cont) return;
+  float ph = now / 600.0f + i * 0.9f;
+  float sx = 1, sy = 1;
+  int x = m.baseX, y = m.baseY;
+  uint32_t age = now - m.bornMs;
+
+  if (age < 700) {                                   // pulinho ao aparecer
+    if (age < 400) {                                 // queda acelerando
+      float p = age / 400.0f;
+      y -= (int)(90 * (1 - p * p));
+    } else if (age < 550) {                          // quique curto
+      y -= (int)(10 * sinf((age - 400) / 150.0f * (float)M_PI));
+    }
+    if (age >= 400 && age < 520) {                   // achata no pouso
+      float t = 1 - (age - 400) / 120.0f;
+      sx = 1 + 0.12f * t; sy = 1 - 0.15f * t;
+    }
+  } else if (m.mood == 1) {                          // feliz: balanca + respira
+    float w = sinf(ph);
+    y += (int)(5 * w);
+    sx = 1 + 0.03f * w; sy = 1 - 0.03f * w;
+  } else if (m.mood == 2) {                          // suando: balanco curto + tremor
+    y += (int)(2 * sinf(ph * 0.6f));
+    x += ((now / MASC_TICK_MS) & 1) ? 1 : -1;
+  } else if (m.mood == 3) {                          // preocupado: "nega" de lado
+    x += (int)(4 * sinf(ph * 0.5f));
+  }
+  lv_obj_set_pos(m.cont, x, y);
+  masc_scale(m, sx, sy);
+
+  if (m.mood == 1) {
+    for (int k = 0; k < 3; k++)                      // brilhos sobem e somem
+      masc_fx_rise(m.fx[k], (now + k * 533) % 1600, 1600, 18, 18);
+    if (m.pupil[0]) {                                // olhar p/ os lados
+      static const int EX[2] = {CLAWD_MD_EYE0_X, CLAWD_MD_EYE1_X};
+      if (!m.lookUntil && (int32_t)(now - m.lookAt) > 0) {
+        m.lookUntil = now + 1400;
+        for (int k = 0; k < 2; k++) {
+          lv_obj_clear_flag(m.lid[k], LV_OBJ_FLAG_HIDDEN);
+          lv_obj_clear_flag(m.pupil[k], LV_OBJ_FLAG_HIDDEN);
+        }
+      }
+      if (m.lookUntil) {
+        if ((int32_t)(now - m.lookUntil) >= 0) {
+          for (int k = 0; k < 2; k++) {
+            lv_obj_add_flag(m.lid[k], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(m.pupil[k], LV_OBJ_FLAG_HIDDEN);
+          }
+          m.lookUntil = 0;
+          m.lookAt = now + 4000 + esp_random() % 4000;
+        } else {
+          uint32_t t = 1400 - (m.lookUntil - now);
+          int dx = t < 500 ? -3 : (t < 1000 ? 3 : 0);
+          for (int k = 0; k < 2; k++) lv_obj_set_x(m.pupil[k], EX[k] + dx);
+        }
+      }
+    }
+  } else if (m.mood == 2) {                          // 2 gotas defasadas
+    lv_obj_t *d[2] = {m.drop, m.fx[0]};
+    for (int k = 0; k < 2; k++) {
+      if (!d[k]) continue;
+      uint32_t cyc = (now + k * 450) % 900;
+      lv_obj_set_y(d[k], 24 + (int)(cyc * 22 / 900));
+      lv_obj_set_style_bg_opa(d[k], (lv_opa_t)(255 - cyc * 190 / 900), 0);
+    }
+  } else if (m.mood == 3 && m.fx[0]) {               // nuvenzinha flutuando
+    lv_obj_set_y(m.fx[0], 2 + (int)(2 * sinf(ph * 1.5f)));
+  }
 }
 
 // ============================================================
@@ -2725,7 +2804,18 @@ void setup() {
   g_wifi.begin();
 
   boot_status(TRS("Conectando ao WiFi...", "Connecting to WiFi..."));
-  if (g_hasToken) {
+  // Reboot do watchdog de WiFi (loop()): PIN da sessao veio pela RTC RAM.
+  // Consumido e zerado aqui; so vale apos reset por software.
+  bool rtcOk = esp_reset_reason() == ESP_RST_SW && g_rtc.magic == RTC_PIN_MAGIC &&
+               g_hasToken && decryptToken(g_blob, g_rtc.pin, g_token, sizeof(g_token));
+  if (rtcOk) strlcpy(g_sessionPin, g_rtc.pin, sizeof(g_sessionPin));
+  rtc_session_clear();
+
+  if (rtcOk) {
+    Serial.println("[PIN] sessao restaurada apos reboot do watchdog de WiFi");
+    g_wifi.autoConnect(WIFI_CONNECT_TIMEOUT_MS, boot_wifi_tick);
+    request_state(g_wifi.isConnected() ? ST_LOADING : ST_ERROR);
+  } else if (g_hasToken) {
     // Tenta WiFi cedo (em paralelo o usuário digita o PIN)
     g_wifi.autoConnect(WIFI_CONNECT_TIMEOUT_MS, boot_wifi_tick);
     request_state(ST_PIN);
@@ -2778,6 +2868,21 @@ void loop() {
     request_state(ST_LOADING);
   }
 
+  // Watchdog de WiFi. Log de campo: o AP desassocia (ASSOC_EXPIRE) e depois
+  // some do scan (NO_AP_FOUND) por minutos, mesmo com o radio reiniciado pelo
+  // maintain(); so reboot recupera. O PIN vai para a RTC RAM e o setup() volta
+  // direto ao dashboard. Sem sessao desbloqueada (tela de PIN/onboarding), nao.
+  static uint32_t offlineSince = 0;
+  if (g_wifi.isConnected() || !g_sessionPin[0] || g_state == ST_WIFI) offlineSince = 0;
+  else if (!offlineSince) offlineSince = millis();
+  else if (millis() - offlineSince > WIFI_REBOOT_AFTER_MS) {
+    Serial.println("[WIFI] offline ha muito tempo, reiniciando");
+    g_rtc.magic = RTC_PIN_MAGIC;
+    strlcpy(g_rtc.pin, g_sessionPin, sizeof(g_rtc.pin));
+    Serial.flush();
+    ESP.restart();
+  }
+
   // Contagem do bloqueio por PIN errado. 250ms para o segundo virar sem atraso
   // visivel; o tick so reescreve o label quando o valor muda. So ST_PIN: o
   // setup de PIN nao tem tentativa nem bloqueio.
@@ -2803,28 +2908,17 @@ void loop() {
       }
       lv_bar_set_value(g_ui.refBar, v, LV_ANIM_OFF);
     }
-    if (now - lastBob > 80) {                       // animação por humor
+    bool mascOn = g_mascN && g_curTile == 0 && g_ui.wkMasc &&
+                  !lv_obj_has_flag(g_ui.wkMasc, LV_OBJ_FLAG_HIDDEN);
+    if (mascOn && now - lastBob > MASC_TICK_MS) {   // animação por humor
       lastBob = now;
-      float ph = now / 600.0f;
-      for (int i = 0; i < g_mascN; i++) {
-        if (!g_masc[i].cont) continue;
-        if (g_masc[i].mood == 1)                    // ok: bob alegre
-          lv_obj_set_y(g_masc[i].cont, g_masc[i].baseY + (int)(2.0f * sinf(ph + i * 0.9f) - 1.0f));
-        else if (g_masc[i].mood == 2) {             // limitado: bob curto + suor
-          lv_obj_set_y(g_masc[i].cont, g_masc[i].baseY + (int)(1.2f * sinf(ph * 0.6f + i)));
-          if (g_masc[i].drop) {
-            uint32_t cyc = (now + i * 300) % 900;
-            lv_obj_set_y(g_masc[i].drop, 24 + (int)(cyc * 22 / 900));
-            lv_obj_set_style_bg_opa(g_masc[i].drop, (lv_opa_t)(255 - cyc * 190 / 900), 0);
-          }
-        }
-      }
+      for (int i = 0; i < g_mascN; i++) masc_tick(g_masc[i], now, i);
     }
     uint32_t bp = blinkClosed ? 150 : 3000;
     if (now - blinkAt > bp) {                        // piscar (só quem está ok)
       blinkAt = now; blinkClosed = !blinkClosed;
       for (int i = 0; i < g_mascN; i++) {
-        if (g_masc[i].mood != 1) continue;
+        if (g_masc[i].mood != 1 || g_masc[i].lookUntil) continue;   // olhando: palpebra e do olhar
         for (int k = 0; k < 2; k++) {
           if (!g_masc[i].lid[k]) continue;
           if (blinkClosed) lv_obj_clear_flag(g_masc[i].lid[k], LV_OBJ_FLAG_HIDDEN);

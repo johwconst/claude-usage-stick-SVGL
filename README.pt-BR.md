@@ -65,7 +65,7 @@ Se você se vira bem num terminal, pule isso e vá para [Compilar e gravar](#com
 
 > As imagens abaixo são **mockups fiéis ao pixel**, renderizados a partir do próprio layout e da
 > paleta do firmware (fotos reais do device em breve) — regenere com
-> `python3 tools/gen_mockups.py`. Correspondem à v2.2, exceto que as quatro telas de swipe ainda
+> `python3 tools/gen_mockups.py`. Correspondem à v2.2, exceto que as três telas de swipe ainda
 > não mostram o selo `@label` da conta, que aparece no cabeçalho quando você adiciona a segunda.
 
 Navegue por **swipe** (os pontinhos embaixo mostram onde você está; o ativo vira uma pílula). A
@@ -85,19 +85,7 @@ refresh — tocar nela atualiza na hora.
 
 <br clear="right">
 
-### 2. Modelos
-<img src="assets/mock-modelos.png" width="400" align="right" alt="Tela Modelos">
-
-- Os 4 mascotes Clawd (Haiku / Sonnet / Opus / Fable) com uma **pílula de status ao vivo** embaixo
-  de cada um, alimentada por uma **sonda real contra a API** (um modelo por ciclo de refresh, em
-  rodízio): `OK 0.9s` (verde, com latência) · `LIMITADO` (âmbar, HTTP 429) · `ERRO` (vermelho,
-  5xx/rede) · `N/D` / `--` (cinza). O mascote fica cinza quando o modelo está inacessível ou sob
-  incidente.
-- Uma **linha de incidentes** do `status.claude.com` (o problema é você ou a Anthropic?).
-
-<br clear="right">
-
-### 3. Janela de 5h
+### 2. Janela de 5h
 <img src="assets/mock-janela5h.png" width="400" align="right" alt="Tela Janela de 5h">
 
 - Gráfico próprio com o **eixo X cobrindo exatamente a janela de 5 h atual** (início → reset).
@@ -107,7 +95,7 @@ refresh — tocar nela atualiza na hora.
 
 <br clear="right">
 
-### 4. Ritmo por hora
+### 3. Ritmo por hora
 <img src="assets/mock-ritmo.png" width="400" align="right" alt="Tela Ritmo por hora">
 
 - **Uso por hora do dia**: 24 barras cuja altura e brilho mostram quais horas queimam mais quota; a
@@ -140,7 +128,8 @@ em `assets/brand/`, convertidos em imagens LVGL embutidas por `tools/gen_logo_as
 Abertos pela engrenagem (lista rolável, linhas de toque de 44 px):
 
 - **Atualizar agora** — força um refresh.
-- **Intervalo de atualização** — 30 s / 1 min / 2 min / 5 min (toque para alternar; salvo na NVS).
+- **Intervalo de atualização** — 15 s / 30 s / 1 min / 2 min / 5 min (toque para alternar; salvo na NVS).
+- **Mascote semanal** — o card SEMANA alterna a cada atualização entre o consumo semanal e o Clawd animado; toque para alternar **Clawd / rodízio** (os 4 modelos com adereço) **/ humor** (segue o uso semanal) **/ desligado**.
 - **Slideshow** — avança as telas sozinho; toque para alternar **off / 5 s / 10 s / 15 s / 30 s**
   (pausa por 10 s depois de qualquer toque).
 - **Fuso: GMT±N** — ajusta o fuso horário (toque para alternar; corrige os relógios de reset).
@@ -247,11 +236,6 @@ anthropic-ratelimit-unified-representative-claim  five_hour | seven_day  (o que 
 anthropic-ratelimit-unified-fallback-percentage
 anthropic-ratelimit-unified-overage-status / -overage-disabled-reason
 ```
-
-A saúde dos modelos combina `status.claude.com/api/v2/incidents/unresolved.json` (incidentes) com
-uma **sonda por modelo**: a cada ciclo de refresh o device manda uma requisição `max_tokens: 1`
-para o próximo modelo do rodízio (Haiku → Sonnet → Opus → Fable) e registra o código HTTP + a
-latência. É isso que alimenta as pílulas coloridas de status na tela Modelos.
 
 ### Tokens por sessão (ponte opcional)
 
