@@ -41,8 +41,13 @@ public:
         // config" e aborta a tentativa que estava em curso.
         if (_retryAt == 0) { _retryAt = now + 30000; return; }
         if ((int32_t)(now - _retryAt) < 0) return;
-        Serial.printf("WiFi: reconnect '%s'\n", _nets[_retryIdx].ssid);
-        WiFi.disconnect(false, false);   // sai do estado "connecting" senao begin() e recusado
+        Serial.printf("WiFi: reconnect '%s' (status=%d)\n", _nets[_retryIdx].ssid, (int)WiFi.status());
+        // Restart completo do STA. disconnect()+begin() nao serve: o disconnect e
+        // assincrono, o begin() seguinte leva "sta is connecting, cannot set
+        // config" e falha calado, e o evento ASSOC_LEAVE ainda desliga o
+        // autoReconnect do core — o radio ficava parado para sempre.
+        WiFi.mode(WIFI_OFF);
+        WiFi.mode(WIFI_STA);             // setSleep(false) persiste no core
         WiFi.begin(_nets[_retryIdx].ssid, _nets[_retryIdx].pass);
         _retryIdx = (_retryIdx + 1) % _count;
         _retryAt = now + 20000;

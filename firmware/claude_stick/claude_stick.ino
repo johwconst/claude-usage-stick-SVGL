@@ -2770,21 +2770,20 @@ void loop() {
     bg_refresh();           // seta g_lastPollMs no fim
   }
 
-<<<<<<< HEAD
   // ST_ERROR nao tem saida propria: quem cai la (tipico: boot mais rapido que o
   // WiFi) ficava preso na tela de falha ate desligar da tomada. Tenta de novo
   // assim que houver rede.
   if (g_state == ST_ERROR && g_wifi.isConnected() && millis() - g_lastPollMs > 15000) {
     g_lastPollMs = millis();
     request_state(ST_LOADING);
-=======
+  }
+
   // Contagem do bloqueio por PIN errado. 250ms para o segundo virar sem atraso
   // visivel; o tick so reescreve o label quando o valor muda. So ST_PIN: o
   // setup de PIN nao tem tentativa nem bloqueio.
   if (g_state == ST_PIN) {
     static uint32_t lastLock = 0;
     if (millis() - lastLock > 250) { lastLock = millis(); pin_lock_tick(); }
->>>>>>> main
   }
 
   // Atualização viva: contadores (1s), barra de refresh (250ms), mascotes,
