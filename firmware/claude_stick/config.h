@@ -45,6 +45,7 @@
 
 // ── Rede / API Claude ────────────────────────────────────
 #define WIFI_CONNECT_TIMEOUT_MS 8000
+#define WIFI_COUNTRY_CODE       "BR"     // canais 1-13; "US" = 1-11, "JP" = 1-14
 #define API_TIMEOUT_MS          15000
 #define MESSAGES_ENDPOINT       "https://api.anthropic.com/v1/messages"
 #define ANTHROPIC_VERSION       "2023-06-01"

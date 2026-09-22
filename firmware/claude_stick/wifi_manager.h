@@ -3,6 +3,7 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_wifi.h>
 #include <Preferences.h>
 #include "config.h"
 
@@ -19,13 +20,22 @@ public:
     bool begin() {
         _prefs.begin("wifi", false);
         _loadAll();
-        WiFi.mode(WIFI_STA);
+        // Scan em TODOS os canais (fast scan para no 1o match e pode pular o AP).
+        WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+        _radioOn();
         WiFi.disconnect();
         // Modem sleep default (DTIM) e a causa classica de queda/latencia nesta
         // placa: o radio dorme entre beacons, perde beacon, o AP derruba.
         WiFi.setSleep(false);
         WiFi.setAutoReconnect(true);
         WiFi.persistent(false);   // nao gravar credencial na NVS do core a cada begin()
+        // Motivo real de cada queda: WiFi.status() so diz "desconectado".
+        WiFi.onEvent([](arduino_event_id_t, arduino_event_info_t info) {
+            uint8_t r = info.wifi_sta_disconnected.reason;
+            Serial.printf("WiFi: caiu, reason=%u (%s) rssi=%d heap=%u\n", r,
+                          WiFi.STA.disconnectReasonName((wifi_err_reason_t)r),
+                          (int)info.wifi_sta_disconnected.rssi, (unsigned)ESP.getFreeHeap());
+        }, ARDUINO_EVENT_WIFI_STA_DISCONNECTED);
         return true;
     }
 
@@ -47,7 +57,7 @@ public:
         // config" e falha calado, e o evento ASSOC_LEAVE ainda desliga o
         // autoReconnect do core — o radio ficava parado para sempre.
         WiFi.mode(WIFI_OFF);
-        WiFi.mode(WIFI_STA);             // setSleep(false) persiste no core
+        _radioOn();                      // setSleep(false) persiste no core
         WiFi.begin(_nets[_retryIdx].ssid, _nets[_retryIdx].pass);
         _retryIdx = (_retryIdx + 1) % _count;
         _retryAt = now + 20000;
@@ -161,6 +171,14 @@ private:
     int _count = 0;
     uint32_t _retryAt = 0;
     int _retryIdx = 0;
+
+    // Liga o STA com pais BR (canais 1-13). O default do IDF e "01" (1-11): AP
+    // no canal 12/13 so era achado por sorte via 802.11d -> NO_AP_FOUND (201)
+    // em loop. Reaplicar a cada mode(WIFI_STA): o mode(WIFI_OFF) desfaz.
+    static void _radioOn() {
+        WiFi.mode(WIFI_STA);
+        esp_wifi_set_country_code(WIFI_COUNTRY_CODE, true);
+    }
 
     void _loadAll() {
         _count = _prefs.getInt("count", 0);
