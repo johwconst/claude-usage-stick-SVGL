@@ -13,6 +13,12 @@ secrets.h
 .vscode/
 .idea/
 CLAUDE.md
+# docs locais que nao vao para o repo publico
+LOGO-MONITOR-DE-USO.md
+# material de divulgacao (carrosseis, legendas) — fica local
+marketing/
+# geradores de imagem (mockups, banners, social, renders, instagram) — ficam locais
+tools-local/
 # ───────── Build / artefatos ─────────
 firmware/*/build/
 .pio/

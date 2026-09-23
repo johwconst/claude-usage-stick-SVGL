@@ -9,7 +9,7 @@ No computer. No app. No cloud.
 
 **English** · [Português](README.pt-BR.md)
 
-<img src="https://img.shields.io/badge/firmware-v2.2-D97757?style=for-the-badge" alt="firmware v2.2">
+<img src="https://img.shields.io/badge/firmware-v2.4-D97757?style=for-the-badge" alt="firmware v2.4">
 <img src="https://img.shields.io/badge/ESP32--S3-AXS15231B%20480×320-1A1A20?style=for-the-badge" alt="ESP32-S3 AXS15231B">
 <img src="https://img.shields.io/badge/LVGL-9.2.2-4ADE80?style=for-the-badge" alt="LVGL 9.2.2">
 <img src="https://img.shields.io/badge/accounts-up%20to%204-8C8C98?style=for-the-badge" alt="up to 4 accounts">
@@ -63,8 +63,8 @@ If you're comfortable with a terminal, skip it and use [Build & flash](#build--f
 ## Screens
 
 > The images below are **pixel-accurate mockups** rendered from the firmware's own layout and
-> palette (real device photos coming soon) — regenerate with `python3 tools/gen_mockups.py`. They
-> match v2.2, except that the three swipe screens do not yet show the `@label` account badge that
+> palette (real device photos coming soon). They
+> match v2.4, except that the three swipe screens do not show the `@label` account badge that
 > appears in the header once you add a second account.
 
 Navigate by **swiping** (the dots at the bottom show your position; the active one becomes a
@@ -211,8 +211,6 @@ design.
   [download it from MakerWorld](https://makerworld.com/en/models/3329534-case-claude-para-display-esp32-mascote).
 
 Made a case of your own? Open a PR adding it to this list.
-
-The two renders come from `tools/gen_case_renders.py`, straight from the STL files.
 
 ---
 
@@ -512,13 +510,12 @@ firmware/
   REFERENCIA-HARDWARE-LVGL.md   # display/colors/touch that work
 tools/
   token_bridge.py               # pushes local token counts to the device
+  claude-code-token-bridge-hook.sh  # SessionStart hook that keeps the bridge running
   gen_logo_assets.py            # brand SVGs -> logo_assets.h
-  gen_mockups.py                # regenerates assets/mock-*.png (the screens)
-  gen_banners.py                # regenerates assets/banner-*.png (README banners)
-  gen_social.py                 # regenerates assets/social-preview*.png (repo social card)
-  gen_case_renders.py           # regenerates assets/case-*.png (renders of the STL cases)
-assets/                         # screen mockups, README banners + brand assets (brand/)
+  partner_logo.py               # writes a logo into a compiled .bin (see build.sh --logo)
+assets/                         # screen mockups, README banners, case renders + brand assets (brand/)
 3D Case/                        # printable cases (STL) for the board
+docs/                           # notes and plans (e.g. porting the firmware to other boards)
 ```
 
 ## Where to tweak

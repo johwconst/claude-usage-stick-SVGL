@@ -51,7 +51,7 @@ static void apiCommonHeaders(const char* token) {
     g_api.addHeader("anthropic-version", ANTHROPIC_VERSION);
     g_api.addHeader("anthropic-beta", "oauth-2025-04-20");
     g_api.addHeader("content-type", "application/json");
-    g_api.addHeader("User-Agent", "claude-code/2.1.5");
+    g_api.addHeader("User-Agent", "claude-code/2.1.280");
     g_api.setTimeout(API_TIMEOUT_MS);
 }
 

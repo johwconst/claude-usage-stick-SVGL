@@ -8,6 +8,12 @@
 #   ./build.sh upload <porta>  # compila + grava na porta indicada
 #   ./build.sh monitor <porta> # abre o serial monitor (115200)
 #
+# Opcao (em qualquer posicao): --logo <arquivo.png|svg>
+#   Grava o logo de um parceiro no lugar do wordmark "CLAUDE CODE" do header.
+#   O firmware e o MESMO: compila normalmente e o tools/partner_logo.py escreve
+#   o logo num slot do .bin ja compilado (e recalcula checksum/SHA-256), antes
+#   de gravar. Serve para o gravador web fazer o mesmo sem recompilar.
+#
 # Pré-requisitos (ver firmware/REFERENCIA-HARDWARE-LVGL.md):
 #   - arduino-cli 1.4.x, core esp32:esp32 3.3.11
 #   - libs: GFX Library for Arduino 1.6.5, lvgl 9.2.2
@@ -23,8 +29,39 @@ PORT_DEFAULT="/dev/cu.usbmodem101"
 
 LVFLAGS="-DLV_CONF_INCLUDE_SIMPLE -I${SKETCH_DIR}"
 
-cmd="${1:-build}"
-port="${2:-$PORT_DEFAULT}"
+# --logo <arquivo> pode vir antes ou depois de cmd/porta
+logo=""; args=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --logo) [ $# -ge 2 ] || { echo "erro: --logo precisa de um arquivo" >&2; exit 1; }
+            logo="$2"; shift 2 ;;
+    *)      args+=("$1"); shift ;;
+  esac
+done
+cmd="${args[0]:-build}"
+port="${args[1]:-$PORT_DEFAULT}"
+
+# Com --logo: compila para um diretorio de saida, aplica o patch no .bin e grava
+# a partir dele (arduino-cli upload --input-dir usa os .bin exportados).
+if [ -n "$logo" ] && [ "$cmd" != "monitor" ]; then
+  OUT_DIR="$(mktemp -d)"
+  echo "==> compilando ($FQBN)"
+  arduino-cli compile \
+    --fqbn "$FQBN" \
+    --build-property "compiler.cpp.extra_flags=$LVFLAGS" \
+    --build-property "compiler.c.extra_flags=$LVFLAGS" \
+    --output-dir "$OUT_DIR" \
+    "$SKETCH_DIR"
+  echo "==> logo do parceiro: $logo"
+  python3 "$SKETCH_DIR/../../tools/partner_logo.py" "$OUT_DIR/claude_stick.ino.bin" "$logo"
+  if [ "$cmd" = "upload" ]; then
+    echo "==> gravando em $port"
+    arduino-cli upload --fqbn "$FQBN" -p "$port" --input-dir "$OUT_DIR" "$SKETCH_DIR"
+  else
+    echo "==> binario com logo: $OUT_DIR/claude_stick.ino.bin"
+  fi
+  exit 0
+fi
 
 case "$cmd" in
   monitor)
