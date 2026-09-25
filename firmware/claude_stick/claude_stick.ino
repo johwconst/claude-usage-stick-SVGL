@@ -2259,7 +2259,7 @@ static const uint8_t THR[4] = {25, 50, 70, 100};
 struct MomentUI {
   lv_obj_t *scrim, *box, *img, *pct, *seg[NSEG];
   lv_obj_t *lid[2], *drop[2], *ring, *xline[4];
-  int win, thr, fromPct;
+  int win, thr, fromPct, toPct;         // thr 0 = "janela renovada"
   int boxY;
   uint32_t t0;
 };
@@ -2269,6 +2269,7 @@ static int g_pendWin = -1, g_pendThr = 0;      // momento aguardando exibição
 static uint8_t g_thrFired[2] = {0, 0};         // bits já disparados por janela
 static float g_thrPrev[2] = {-1, -1};
 static bool g_thrBase = false;
+static float g_renewFrom = 0;                  // % da janela 5h antes do reset
 static lv_point_precise_t g_moXPts[4][2];      // olhos em X (KO)
 
 // Detecta cruzamento de limiar após cada fetch. Baseline no 1º fetch (não
@@ -2278,6 +2279,10 @@ static void check_thresholds() {
   for (int w = 0; w < 2; w++) {
     if (g_thrBase && (g_thrPrev[w] - c[w]) > 15.0f && g_mascEvt != REACT_SCARED)
       g_mascEvt = REACT_PARTY;           // janela reiniciou: Clawd comemora
+    if (w == 0 && g_thrBase && (g_thrPrev[w] - c[w]) > 15.0f) {
+      g_renewFrom = g_thrPrev[w];          // aviso "janela renovada", contador desce ate o atual
+      g_pendWin = 0; g_pendThr = 0;
+    }
     if (!g_thrBase || (g_thrPrev[w] - c[w]) > 15.0f) {
       g_thrFired[w] = 0;
       for (int i = 0; i < 4; i++) if (c[w] >= THR[i]) g_thrFired[w] |= 1 << i;
@@ -2304,7 +2309,13 @@ static void moment_close_cb(lv_event_t *e) { (void)e; moment_close(); }
 static void show_moment(int win, int thr) {
   moment_close();
   g_mo.win = win; g_mo.thr = thr;
-  g_mo.fromPct = (thr == 25) ? 0 : (thr == 50) ? 25 : (thr == 70) ? 50 : 70;
+  if (thr == 0) {                       // janela renovada: desce do % antigo ao atual
+    g_mo.fromPct = (int)(g_renewFrom + 0.5f);
+    g_mo.toPct = (int)(g_usage.h5 + 0.5f);
+  } else {
+    g_mo.fromPct = (thr == 25) ? 0 : (thr == 50) ? 25 : (thr == 70) ? 50 : 70;
+    g_mo.toPct = thr;
+  }
   g_mo.t0 = millis();
   g_momentUntil = g_mo.t0 + 4600;
 
@@ -2388,13 +2399,14 @@ static void show_moment(int win, int thr) {
                             &lv_font_montserrat_20, C_MUTED);
   lv_obj_set_pos(win_l, 240, 42);
   g_mo.pct = tlabel(s, &lv_font_montserrat_48, C_OK, 240, 70);
-  const char *MSG[4] = {
+  const char *MSG[5] = {
     TRS("Comecando \xE2\x80\xA2 ritmo tranquilo",       "Just starting \xE2\x80\xA2 easy pace"),
     TRS("Metade da janela usada",                       "Half the window used"),
     TRS("Atencao \xE2\x80\xA2 uso alto",                "Heads up \xE2\x80\xA2 heavy usage"),
     TRS("Limite atingido \xE2\x80\xA2 aguarde o reset", "Limit reached \xE2\x80\xA2 wait for the reset"),
+    TRS("Janela renovada! \xE2\x80\xA2 uso zerado",       "Window renewed! \xE2\x80\xA2 usage reset"),
   };
-  int mi = (thr == 25) ? 0 : (thr == 50) ? 1 : (thr == 70) ? 2 : 3;
+  int mi = (thr == 0) ? 4 : (thr == 25) ? 0 : (thr == 50) ? 1 : (thr == 70) ? 2 : 3;
   lv_obj_t *msg = mklabel(s, MSG[mi], &lv_font_montserrat_16, C_TEXT);
   lv_obj_set_pos(msg, 240, 148);
   lv_obj_set_width(msg, 232);
@@ -2423,7 +2435,7 @@ static void moment_tick() {
   if (t < 450) {
     float p = t / 450.0f;
     y = g_mo.boxY - (int)((1.0f - p) * (1.0f - p) * 60.0f);
-  } else if (g_mo.thr == 25 || g_mo.thr == 50) {
+  } else if (g_mo.thr == 0 || g_mo.thr == 25 || g_mo.thr == 50) {
     y = g_mo.boxY + (int)(4.0f * sinf((t - 450) / 260.0f));           // bounce feliz
   } else if (g_mo.thr == 70) {
     x = 36 + (((t / 70) % 2) ? 2 : -2);                                // treme
@@ -2434,7 +2446,7 @@ static void moment_tick() {
 
   // contador de % (200ms..1100ms) + medidor acendendo em sequência
   float p = (t < 200) ? 0 : (t > 1100 ? 1.0f : (t - 200) / 900.0f);
-  float v = g_mo.fromPct + (g_mo.thr - g_mo.fromPct) * p;
+  float v = g_mo.fromPct + (g_mo.toPct - g_mo.fromPct) * p;
   char b[12]; snprintf(b, sizeof(b), "%d%%", (int)(v + 0.5f));
   lv_label_set_text(g_mo.pct, b);
   lv_obj_set_style_text_color(g_mo.pct, grad_color(v), 0);
