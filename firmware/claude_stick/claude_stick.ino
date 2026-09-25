@@ -20,6 +20,7 @@
 #include <Wire.h>
 #include <WiFi.h>
 #include <WebServer.h>
+#include <Update.h>
 #include <ESPmDNS.h>
 #include <Preferences.h>
 #include <LittleFS.h>
@@ -192,6 +193,7 @@ static void refresh_ui_values();
 static void dash_tick();
 static void set_hdr_status();
 static void apply_tz();
+static void week_face_apply();
 static void ui_pin();
 static void pin_lock_tick();
 static void ui_wifi();
@@ -211,20 +213,50 @@ static void show_moment(int win, int thr);
 static void moment_tick();
 static void moment_close();
 
-// Descritor LVGL do logo de parceiro, montado uma vez a partir do slot. Os
-// pixels ficam na flash (DROM mapeada), o LVGL le direto de la.
-static const lv_image_dsc_t *partner_dsc() {
+// ---- Logo personalizada no header ----
+// Duas origens, mesmo formato (ARGB8888 em bytes B,G,R,A, ate PARTNER_MAX_W x
+// PARTNER_MAX_H): enviada pelo painel web (LittleFS /logo.bin, carregada na
+// PSRAM; vence) ou gravada no .bin pelo tools/partner_logo.py (partner_slot).
+#define LOGO_FILE  "/logo.bin"
+#define LOGO_MAGIC 0x4F474F4Cu               // "LOGO"
+struct LogoHdr { uint32_t magic; uint16_t w, h; };
+static uint8_t *g_logoPx = nullptr;          // logo do painel web (PSRAM)
+static uint16_t g_logoW = 0, g_logoH = 0;
+static bool     logo_present() { return g_logoPx || partnerLogoPresent(); }
+static uint16_t logo_w() { return g_logoPx ? g_logoW : partnerLogoW(); }
+static uint16_t logo_h() { return g_logoPx ? g_logoH : partnerLogoH(); }
+// Descritor estatico reapontado a cada chamada: imagem ja criada com ele passa
+// a ver a logo nova (o rebuild de tela vem logo depois).
+static const lv_image_dsc_t *logo_dsc() {
   static lv_image_dsc_t d;
-  if (d.data == nullptr) {
-    d.header.magic = LV_IMAGE_HEADER_MAGIC;
-    d.header.cf = LV_COLOR_FORMAT_ARGB8888;
-    d.header.w = partnerLogoW();
-    d.header.h = partnerLogoH();
-    d.header.stride = d.header.w * 4;
-    d.data_size = (uint32_t)d.header.w * d.header.h * 4;
-    d.data = g_partnerSlot.px;
-  }
+  d.header.magic = LV_IMAGE_HEADER_MAGIC;
+  d.header.cf = LV_COLOR_FORMAT_ARGB8888;
+  d.header.w = logo_w();
+  d.header.h = logo_h();
+  d.header.stride = d.header.w * 4;
+  d.data_size = (uint32_t)d.header.w * d.header.h * 4;
+  d.data = g_logoPx ? g_logoPx : g_partnerSlot.px;
   return &d;
+}
+// Troca a logo web (px = nullptr volta para a do .bin / wordmark).
+static void logo_set(uint8_t *px, uint16_t w, uint16_t h) {
+  uint8_t *old = g_logoPx;
+  g_logoPx = px; g_logoW = w; g_logoH = h;
+  logo_dsc();                                // reaponta antes de liberar o antigo
+  if (old) heap_caps_free(old);
+}
+static void load_web_logo() {
+  if (!LittleFS.exists(LOGO_FILE)) return;
+  File f = LittleFS.open(LOGO_FILE, "r");
+  LogoHdr h;
+  bool ok = f && f.read((uint8_t *)&h, sizeof(h)) == sizeof(h) && h.magic == LOGO_MAGIC &&
+            h.w >= 1 && h.w <= PARTNER_MAX_W && h.h >= 1 && h.h <= PARTNER_MAX_H;
+  size_t n = ok ? (size_t)h.w * h.h * 4 : 0;
+  uint8_t *px = ok ? (uint8_t *)heap_caps_malloc(n, MALLOC_CAP_SPIRAM) : nullptr;
+  if (px && f.read(px, n) == n) logo_set(px, h.w, h.h);
+  else if (px) heap_caps_free(px);
+  if (f) f.close();
+  Serial.printf("[LOGO] web: %s\n", g_logoPx ? "carregada" : "invalida");
 }
 
 // ============================================================
@@ -711,6 +743,108 @@ static lv_obj_t *g_tokMsg = nullptr;            // status na tela do device
 
 static void stop_web() { if (g_web) { g_web->stop(); delete g_web; g_web = nullptr; } }
 
+// Reboot que volta direto ao dashboard: o PIN da sessao vai para a RTC RAM e o
+// setup() o consome (so apos reset por software). Usado pelo watchdog de WiFi e
+// pelo fim do OTA.
+static void reboot_keep_session(const char *why) {
+  Serial.printf("[BOOT] reiniciando: %s\n", why);
+  if (g_sessionPin[0]) {
+    g_rtc.magic = RTC_PIN_MAGIC;
+    strlcpy(g_rtc.pin, g_sessionPin, sizeof(g_rtc.pin));
+  }
+  Serial.flush();
+  ESP.restart();
+}
+
+// ---- OTA pela pagina /update ----
+// So aceita dentro de uma janela aberta tocando em Ajustes no proprio device:
+// sem isso qualquer um na rede local gravaria um firmware que le o token.
+#define OTA_WINDOW_MS (5UL * 60UL * 1000UL)
+static uint32_t g_otaUntil = 0;          // 0 = fechado
+static bool     g_otaBusy = false;       // Update em andamento
+static bool     g_otaOk = false;         // ultimo upload terminou valido
+static uint32_t g_otaBytes = 0;
+static uint32_t g_otaRebootAt = 0;
+static lv_obj_t *g_otaLbl = nullptr;     // progresso na lv_layer_top
+static bool ota_open() {
+  if (!g_otaUntil) return false;
+  if ((int32_t)(millis() - g_otaUntil) < 0) return true;
+  g_otaUntil = 0;
+  return false;
+}
+static void ota_progress(const char *txt) {
+  if (!g_otaLbl) {
+    g_otaLbl = lv_label_create(lv_layer_top());
+    lv_obj_set_style_text_font(g_otaLbl, &lv_font_montserrat_18, 0);
+    lv_obj_set_style_text_color(g_otaLbl, lv_color_hex(C_TEXT), 0);
+    lv_obj_set_style_bg_color(g_otaLbl, lv_color_hex(C_SURFACE2), 0);
+    lv_obj_set_style_bg_opa(g_otaLbl, LV_OPA_COVER, 0);
+    lv_obj_set_style_pad_all(g_otaLbl, 14, 0);
+    lv_obj_set_style_radius(g_otaLbl, 12, 0);
+    lv_obj_center(g_otaLbl);
+  }
+  lv_label_set_text(g_otaLbl, txt);
+  lv_refr_now(NULL);
+}
+static const char OTA_CLOSED[] = "OTA fechado. No device: Ajustes > Atualizar firmware (abre por 5 min).";
+static const char OTA_PAGE[] PROGMEM =
+  "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+  "<title>Claude Usage Stick - OTA</title>"
+  "<body style='font-family:sans-serif;background:#0f0f12;color:#f2f0ec;max-width:420px;margin:40px auto'>"
+  "<h2>Atualizar firmware</h2>"
+  "<p>Envie o <code>claude_stick.ino.bin</code>. O device reinicia sozinho e volta ao dashboard.</p>"
+  "<form method=POST action=/update enctype=multipart/form-data>"
+  "<input type=file name=firmware accept=.bin required> <button>Enviar</button></form>";
+static void handleUpdatePage() {
+  if (!ota_open()) { g_web->send(403, "text/plain; charset=utf-8", OTA_CLOSED); return; }
+  g_web->send_P(200, "text/html; charset=utf-8", OTA_PAGE);
+}
+static void handleUpdateUpload() {
+  HTTPUpload &u = g_web->upload();
+  if (u.status == UPLOAD_FILE_START) {
+    g_otaOk = false; g_otaBytes = 0;
+    if (!ota_open()) return;             // g_otaBusy fica false: nada e gravado
+    g_otaBusy = Update.begin(UPDATE_SIZE_UNKNOWN);
+    Serial.printf("[OTA] inicio '%s': %s\n", u.filename.c_str(),
+                  g_otaBusy ? "ok" : Update.errorString());
+    ota_progress(TRS("Atualizando firmware...", "Updating firmware..."));
+  } else if (u.status == UPLOAD_FILE_WRITE && g_otaBusy) {
+    if (Update.write(u.buf, u.currentSize) != u.currentSize) {
+      Serial.printf("[OTA] erro de escrita: %s\n", Update.errorString());
+      Update.abort(); g_otaBusy = false;
+      return;
+    }
+    g_otaBytes += u.currentSize;
+    static uint32_t lastBlk = 0;
+    if (g_otaBytes / 65536 != lastBlk) {  // redesenha a cada 64 KB
+      lastBlk = g_otaBytes / 65536;
+      char m[48];
+      snprintf(m, sizeof(m), TRS("Atualizando firmware... %u KB", "Updating firmware... %u KB"),
+               (unsigned)(g_otaBytes / 1024));
+      ota_progress(m);
+    }
+  } else if (u.status == UPLOAD_FILE_END && g_otaBusy) {
+    g_otaOk = Update.end(true);          // valida a imagem e troca a particao de boot
+    g_otaBusy = false;
+    Serial.printf("[OTA] fim: %u bytes, %s\n", (unsigned)g_otaBytes,
+                  g_otaOk ? "ok" : Update.errorString());
+  } else if (u.status == UPLOAD_FILE_ABORTED && g_otaBusy) {
+    Update.abort(); g_otaBusy = false;
+    Serial.println("[OTA] upload abortado");
+  }
+}
+static void handleUpdateDone() {
+  if (g_otaOk) {
+    g_web->send(200, "text/plain; charset=utf-8", "OK. Reiniciando...");
+    ota_progress(TRS("Firmware atualizado. Reiniciando...", "Firmware updated. Restarting..."));
+    g_otaRebootAt = millis() + 1000;     // deixa a resposta sair antes do reboot
+    return;
+  }
+  if (g_otaLbl) { lv_obj_delete(g_otaLbl); g_otaLbl = nullptr; }
+  if (!ota_open()) { g_web->send(403, "text/plain; charset=utf-8", OTA_CLOSED); return; }
+  g_web->send(500, "text/plain; charset=utf-8", String("Falha: ") + Update.errorString());
+}
+
 static bool g_mdnsUp = false;
 static void ensure_mdns() {
   if (g_mdnsUp || !g_wifi.isConnected()) return;
@@ -872,23 +1006,246 @@ static void handleTokensPost() {
   g_web->send(200, "application/json", "{\"ok\":true}");
   update_tok_row();
 }
-static void handleInfo() {
-  String h = F("<!doctype html><html lang=pt><head><meta charset=utf-8>"
-               "<meta name=viewport content='width=device-width,initial-scale=1'>"
-               "<title>Claude Usage Stick</title><style>" WEB_CSS "</style></head><body><div class=card>"
-               "<h1>" WEB_SPARK " Claude Usage Stick</h1>"
-               "<p>Device online. Endpoints: <code>GET /window</code> (janela atual) e "
-               "<code>POST /tokens</code> (bridge de tokens por sessao — ver tools/token_bridge.py).</p>"
-               "</div></body></html>");
-  g_web->send(200, "text/html; charset=utf-8", h);
+// ---- Painel web (GET /): mesmos dados da tela + ajustes pelo navegador ----
+// Pagina estatica; os dados vem de /api/state (JSON) a cada 15s. Sem CDN: o
+// grafico e SVG montado no JS. O token nunca sai por aqui.
+static const char PANEL_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang=pt><head><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Claude Usage Stick</title>
+<style>
+:root{--bg:#0F0F12;--card:#1A1A20;--bd:#30303A;--tx:#F2F0EC;--mut:#8C8C98;--cor:#D97757;--ok:#4ADE80;--warn:#FBBF24;--bad:#F87171}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:18px}
+main{max-width:760px;margin:auto}h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bottom:16px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:18px;margin-bottom:12px}
+.lbl{color:var(--mut);font-size:12px;letter-spacing:.08em}.pct{font-size:44px;font-weight:700;margin:4px 0}
+.bar{height:8px;background:#26262E;border-radius:4px;overflow:hidden}.bar i{display:block;height:100%}
+.cd{color:var(--mut);font-size:13px;margin-top:8px}svg{width:100%;height:180px}
+label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}select{width:100%;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:10px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}button{margin-top:14px;width:100%;background:var(--cor);color:#1A1A20;border:0;border-radius:10px;padding:12px;font-weight:700;font-size:15px}
+#msg{color:var(--mut);font-size:13px;margin-top:8px;min-height:1em}input[type=file]{width:100%;color:var(--mut);font-size:13px;margin-top:10px}
+#otab{height:8px;background:#26262E;border-radius:4px;overflow:hidden;margin-top:12px;display:none}#otab i{display:block;height:100%;width:0;background:var(--cor)}
+.leg{font-size:12px;color:var(--mut)}.leg b{display:inline-block;width:10px;height:3px;margin:0 4px 2px 10px}
+@media(max-width:560px){.row,.grid{grid-template-columns:1fr}}
+</style></head><body><main>
+<h1>Claude Usage Stick</h1><div class=sub id=sub>carregando...</div>
+<div class=row>
+<div class=card><div class=lbl>5 HORAS</div><div class=pct id=p5>--</div><div class=bar><i id=b5></i></div><div class=cd id=c5></div></div>
+<div class=card><div class=lbl>SEMANA</div><div class=pct id=p7>--</div><div class=bar><i id=b7></i></div><div class=cd id=c7></div></div>
+</div>
+<div class=card><div class=lbl>HISTORICO</div><span class=leg><b style="background:var(--cor)"></b>5h<b style="background:#7DD3FC"></b>semana</span>
+<svg id=ch viewBox="0 0 700 180" preserveAspectRatio=none></svg></div>
+<form class=card id=f><div class=lbl>AJUSTES</div><div class=grid>
+<div><label>Intervalo de atualizacao</label><select name=poll><option value=15>15 s<option value=30>30 s<option value=60>1 min<option value=120>2 min<option value=300>5 min</select></div>
+<div><label>Brilho</label><select name=bri><option value=0>baixo<option value=1>medio<option value=2>alto</select></div>
+<div><label>Fuso (GMT)</label><select name=tz id=tz></select></div>
+<div><label>Slideshow</label><select name=slide><option value=0>desligado<option value=5>5 s<option value=10>10 s<option value=15>15 s<option value=30>30 s</select></div>
+<div><label>Mascote semanal</label><select name=wmasc><option value=1>Clawd<option value=2>rodizio<option value=3>humor<option value=0>desligado</select></div>
+<div><label>Idioma da tela</label><select name=lang><option value=0>Portugues<option value=1>English</select></div>
+</div><button>Salvar</button><div id=msg></div></form>
+<div class=card><div class=lbl>LOGO DO HEADER</div><div class=cd id=lgst></div>
+<canvas id=lgc width=0 height=0 style="background:#0F0F12;border-radius:6px;margin-top:10px;max-width:100%"></canvas>
+<input type=file id=lgf accept="image/png,image/svg+xml,image/jpeg,image/webp"><div class=grid>
+<button id=lgup type=button>Enviar logo</button><button id=lgdel type=button style="background:#24242C;color:#F2F0EC">Remover logo</button>
+</div><div id=lgmsg class=cd></div></div>
+<div class=card><div class=lbl>FIRMWARE</div><div class=cd id=otast></div>
+<input type=file id=fw accept=.bin><div id=otab><i id=otap></i></div>
+<button id=otabtn type=button>Atualizar firmware</button><div id=otamsg class=cd></div></div>
+</main><script>
+const $=i=>document.getElementById(i);
+for(let z=-12;z<=14;z++){const o=document.createElement('option');o.value=z;o.textContent=(z>=0?'+':'')+z;$('tz').appendChild(o)}
+const col=p=>p>=90?'var(--bad)':p>=70?'var(--warn)':'var(--ok)';
+function cd(ep,now){if(!ep||!now)return'';let s=ep-now;if(s<=0)return'resetando...';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
+const t=new Date(ep*1000).toLocaleString('pt-BR',{weekday:'short',hour:'2-digit',minute:'2-digit'});return'reseta em '+(d?d+'d ':'')+h+'h'+String(m).padStart(2,'0')+' ('+t+')'}
+function card(k,p,ep,now){$('p'+k).textContent=Math.round(p)+'%';$('p'+k).style.color=col(p);$('b'+k).style.width=Math.min(100,p)+'%';$('b'+k).style.background=col(p);$('c'+k).textContent=cd(ep,now)}
+function chart(h){const W=700,H=180;let g='';for(const y of[25,50,75])g+=`<line x1=0 x2=${W} y1=${H-y*H/100} y2=${H-y*H/100} stroke=#26262E />`;
+if(h.length>1){const pts=k=>h.map((r,i)=>(i*W/(h.length-1)).toFixed(1)+','+(H-r[k]*H/100).toFixed(1)).join(' ');
+g+=`<polyline points="${pts(2)}" fill=none stroke=#7DD3FC stroke-width=2 /><polyline points="${pts(1)}" fill=none stroke=#D97757 stroke-width=2.5 />`}
+else g+=`<text x=12 y=24 fill=#8C8C98 font-size=14>sem historico ainda</text>`;$('ch').innerHTML=g}
+let loaded=false;
+async function load(){try{const r=await fetch('/api/state');const j=await r.json();
+card(5,j.h5,j.h5_reset,j.now);card(7,j.d7,j.d7_reset,j.now);chart(j.hist);
+const age=j.last_ok_s<0?'nunca':j.last_ok_s<60?j.last_ok_s+'s':Math.round(j.last_ok_s/60)+'min';
+$('sub').textContent=`@${j.account} \u2022 ${j.status||'-'} \u2022 atualizado ha ${age}`+(j.fetch_ok?'':' \u2022 ultima atualizacao FALHOU')+` \u2022 v${j.fw}`;
+if(!loaded){for(const k of['poll','bri','tz','slide','wmasc','lang'])$('f')[k].value=j.cfg[k];loaded=true}
+$('otast').textContent=j.ota_s>0?`Janela de OTA aberta: ${Math.floor(j.ota_s/60)}:${String(j.ota_s%60).padStart(2,'0')} restantes`
+:'Janela de OTA fechada. No device: Ajustes \u2192 Atualizar firmware (abre por 5 min).';
+$('lgst').textContent={web:'Logo atual: enviada pelo painel.',build:'Logo atual: gravada no firmware (--logo).',none:'Sem logo: o header mostra o texto CLAUDE CODE.'}[j.logo]||'';
+$('otast').style.color=j.ota_s>0?'var(--ok)':'var(--mut)'}catch(e){$('sub').textContent='device inacessivel'}}
+// Logo: recorta bordas transparentes, cabe em 170x36 e converte p/ B,G,R,A
+// (mesmo pipeline do tools/partner_logo.py, so que no navegador).
+let lg=null;
+$('lgf').onchange=async()=>{lg=null;const f=$('lgf').files[0];if(!f)return;
+try{const im=new Image();im.src=URL.createObjectURL(f);await im.decode();
+let W=im.naturalWidth||512,H=im.naturalHeight||512;const k=Math.min(1,2048/Math.max(W,H));W=Math.round(W*k);H=Math.round(H*k);
+const c=document.createElement('canvas');c.width=W;c.height=H;const cx=c.getContext('2d');cx.drawImage(im,0,0,W,H);
+const d=cx.getImageData(0,0,W,H).data;let x0=W,y0=H,x1=-1,y1=-1;
+for(let y=0;y<H;y++)for(let x=0;x<W;x++)if(d[(y*W+x)*4+3]>8){if(x<x0)x0=x;if(x>x1)x1=x;if(y<y0)y0=y;if(y>y1)y1=y}
+if(x1<0){$('lgmsg').textContent='imagem vazia (tudo transparente)';return}
+const bw=x1-x0+1,bh=y1-y0+1,s=Math.min(170/bw,36/bh),w=Math.max(1,Math.round(bw*s)),h=Math.max(1,Math.round(bh*s));
+const o=$('lgc');o.width=w;o.height=h;const ox=o.getContext('2d');ox.imageSmoothingQuality='high';ox.clearRect(0,0,w,h);ox.drawImage(c,x0,y0,bw,bh,0,0,w,h);
+const px=ox.getImageData(0,0,w,h).data,b=new Uint8Array(w*h*4);
+for(let i=0;i<px.length;i+=4){b[i]=px[i+2];b[i+1]=px[i+1];b[i+2]=px[i];b[i+3]=px[i+3]}
+lg={w,h,b};$('lgmsg').textContent=`${w}x${h} px \u2014 pronto para enviar (fundo transparente fica melhor)`}
+catch(e){$('lgmsg').textContent='nao consegui ler a imagem'}};
+$('lgup').onclick=async()=>{if(!lg){$('lgmsg').textContent='escolha uma imagem';return}
+const fd=new FormData();fd.append('logo',new Blob([lg.b]),'logo.raw');$('lgmsg').textContent='enviando...';
+const r=await fetch(`/api/logo?w=${lg.w}&h=${lg.h}`,{method:'POST',body:fd});$('lgmsg').textContent=r.ok?'logo aplicada':'erro: '+await r.text();load()};
+$('lgdel').onclick=async()=>{const r=await fetch('/api/logo/delete',{method:'POST'});$('lgmsg').textContent=r.ok?'logo removida':'erro';load()};
+function waitBack(){$('otamsg').textContent='reiniciando... aguardando o device voltar';
+const t=setInterval(async()=>{try{const r=await fetch('/api/state',{cache:'no-store'});if(r.ok){clearInterval(t);location.reload()}}catch(e){}},2000)}
+$('otabtn').onclick=()=>{const f=$('fw').files[0];if(!f){$('otamsg').textContent='escolha o arquivo .bin';return}
+const x=new XMLHttpRequest(),fd=new FormData();fd.append('firmware',f,f.name);
+$('otab').style.display='block';$('otap').style.width='0';$('otabtn').disabled=true;
+x.upload.onprogress=e=>{if(e.lengthComputable){const p=Math.round(e.loaded*100/e.total);$('otap').style.width=p+'%';$('otamsg').textContent='enviando '+p+'%'}};
+x.onload=()=>{$('otabtn').disabled=false;if(x.status==200){$('otap').style.width='100%';waitBack()}else $('otamsg').textContent='erro ('+x.status+'): '+x.responseText};
+x.onerror=()=>{$('otabtn').disabled=false;$('otamsg').textContent='falha de conexao durante o envio'};
+x.open('POST','/update');x.send(fd)};
+$('f').onsubmit=async e=>{e.preventDefault();$('msg').textContent='salvando...';
+const r=await fetch('/api/settings',{method:'POST',body:new URLSearchParams(new FormData($('f')))});
+$('msg').textContent=r.ok?'salvo':'erro: '+await r.text();load()};
+load();setInterval(load,15000);
+</script></body></html>)HTML";
+
+// Upload da logo ja convertida pelo painel (w/h na query, pixels B,G,R,A no
+// corpo multipart). Cosmetico: sem janela de toque, como os ajustes.
+static uint8_t *g_logoUp = nullptr;
+static size_t   g_logoUpN = 0, g_logoUpMax = 0;
+static bool     g_logoUpOk = false;
+static void logo_up_free() { if (g_logoUp) { heap_caps_free(g_logoUp); g_logoUp = nullptr; } }
+static void logo_redraw() { if (g_state == ST_MAIN || g_state == ST_ABOUT) request_state(g_state); }
+static void handleLogoUpload() {
+  HTTPUpload &u = g_web->upload();
+  if (u.status == UPLOAD_FILE_START) {
+    logo_up_free(); g_logoUpOk = false; g_logoUpN = 0;
+    int w = g_web->arg("w").toInt(), h = g_web->arg("h").toInt();
+    if (w < 1 || w > PARTNER_MAX_W || h < 1 || h > PARTNER_MAX_H) return;
+    g_logoUpMax = (size_t)w * h * 4;
+    g_logoUp = (uint8_t *)heap_caps_malloc(g_logoUpMax, MALLOC_CAP_SPIRAM);
+  } else if (u.status == UPLOAD_FILE_WRITE && g_logoUp) {
+    if (g_logoUpN + u.currentSize > g_logoUpMax) { logo_up_free(); return; }
+    memcpy(g_logoUp + g_logoUpN, u.buf, u.currentSize);
+    g_logoUpN += u.currentSize;
+  } else if (u.status == UPLOAD_FILE_END && g_logoUp) {
+    g_logoUpOk = (g_logoUpN == g_logoUpMax);
+  } else if (u.status == UPLOAD_FILE_ABORTED) {
+    logo_up_free();
+  }
+}
+static void handleLogoDone() {
+  if (!g_logoUp || !g_logoUpOk) {
+    logo_up_free();
+    g_web->send(400, "text/plain; charset=utf-8", "logo invalida (tamanho ou dimensoes)");
+    return;
+  }
+  uint16_t w = g_web->arg("w").toInt(), h = g_web->arg("h").toInt();
+  LogoHdr hd = {LOGO_MAGIC, w, h};
+  File f = LittleFS.open(LOGO_FILE, "w");
+  bool ok = f && f.write((const uint8_t *)&hd, sizeof(hd)) == sizeof(hd) &&
+            f.write(g_logoUp, g_logoUpN) == g_logoUpN;
+  if (f) f.close();
+  if (!ok) {
+    LittleFS.remove(LOGO_FILE); logo_up_free();
+    g_web->send(500, "text/plain; charset=utf-8", "falha ao gravar no LittleFS");
+    return;
+  }
+  logo_set(g_logoUp, w, h);
+  g_logoUp = nullptr; g_logoUpOk = false;
+  Serial.printf("[LOGO] nova logo web %ux%u\n", w, h);
+  g_web->send(200, "text/plain", "ok");
+  logo_redraw();
+}
+static void handleLogoDelete() {
+  LittleFS.remove(LOGO_FILE);
+  logo_set(nullptr, 0, 0);
+  Serial.println("[LOGO] logo web removida");
+  g_web->send(200, "text/plain", "ok");
+  logo_redraw();
+}
+
+static void handlePanel() { g_web->send_P(200, "text/html; charset=utf-8", PANEL_PAGE); }
+
+static void handleState() {
+  String j;
+  j.reserve(700 + g_histN * 22);
+  char b[512];
+  long lastOk = g_lastOkMs ? (long)((millis() - g_lastOkMs) / 1000) : -1;
+  snprintf(b, sizeof(b),
+           "{\"now\":%lu,\"h5\":%.1f,\"d7\":%.1f,\"h5_reset\":%lu,\"d7_reset\":%lu,"
+           "\"status\":\"%s\",\"fetch_ok\":%s,\"last_ok_s\":%ld,\"account\":\"%s\",\"fw\":\"" FW_VERSION "\","
+           "\"ota_s\":%lu,\"logo\":\"%s\","
+           "\"cfg\":{\"poll\":%d,\"bri\":%d,\"tz\":%d,\"slide\":%d,\"wmasc\":%d,\"lang\":%d},\"hist\":[",
+           (unsigned long)time(nullptr), g_usage.h5, g_usage.d7,
+           (unsigned long)g_usage.h5ResetEpoch, (unsigned long)g_usage.d7ResetEpoch,
+           g_usage.statusOverall, g_lastFetchOk ? "true" : "false", lastOk,
+           g_accts.label[g_accts.active],
+           ota_open() ? (unsigned long)((g_otaUntil - millis()) / 1000) : 0UL,
+           g_logoPx ? "web" : (partnerLogoPresent() ? "build" : "none"),
+           g_pollSec, g_briIdx, g_tzOffset, g_slideSec, g_weekMasc, (int)g_lang);
+  j += b;
+  for (int i = 0; i < g_histN; i++) {
+    const Sample &sm = g_hist[hist_idx(i)];
+    snprintf(b, sizeof(b), "%s[%lu,%u,%u]", i ? "," : "", (unsigned long)sm.t, sm.h5, sm.d7);
+    j += b;
+  }
+  j += "]}";
+  g_web->send(200, "application/json", j);
+}
+
+// Aplica o que veio do formulario. Cada campo e opcional e validado contra os
+// mesmos valores que os botoes da tela oferecem.
+static void handleSettingsPost() {
+  auto has = [](const char *k) { return g_web->hasArg(k); };
+  auto num = [](const char *k) { return (int)g_web->arg(k).toInt(); };
+  bool langChanged = false;
+  if (has("poll")) {
+    int v = num("poll");
+    if (v != 15 && v != 30 && v != 60 && v != 120 && v != 300) { g_web->send(400, "text/plain", "poll"); return; }
+    g_pollSec = v; g_prefs.putInt("poll", v);
+  }
+  if (has("bri")) {
+    int v = num("bri");
+    if (v < 0 || v > 2) { g_web->send(400, "text/plain", "bri"); return; }
+    g_briIdx = v; g_prefs.putInt("bri", v); apply_brightness();
+  }
+  if (has("tz")) {
+    int v = num("tz");
+    if (v < -12 || v > 14) { g_web->send(400, "text/plain", "tz"); return; }
+    g_tzOffset = v; g_prefs.putInt("tz", v); apply_tz();
+  }
+  if (has("slide")) {
+    int v = num("slide");
+    if (v != 0 && v != 5 && v != 10 && v != 15 && v != 30) { g_web->send(400, "text/plain", "slide"); return; }
+    g_slideSec = v; g_prefs.putInt("slide", v);
+  }
+  if (has("wmasc")) {
+    int v = num("wmasc");
+    if (v < 0 || v > 3) { g_web->send(400, "text/plain", "wmasc"); return; }
+    g_weekMasc = v; g_prefs.putInt("wmasc", v);
+  }
+  if (has("lang")) {
+    int v = num("lang");
+    if (v != 0 && v != 1) { g_web->send(400, "text/plain", "lang"); return; }
+    langChanged = (v != g_lang);
+    g_lang = (uint8_t)v; g_prefs.putInt("lang", v);
+  }
+  Serial.println("[WEB] ajustes atualizados pelo painel");
+  g_web->send(200, "text/plain", "ok");
+  // Reflete na tela: Ajustes redesenha os rotulos; idioma exige rebuild.
+  if (g_state == ST_SETTINGS || (langChanged && g_state == ST_MAIN)) request_state(g_state);
+  else if (g_state == ST_MAIN) week_face_apply();
 }
 static void start_data_web() {
   stop_web();
   ensure_mdns();
   g_web = new WebServer(80);
-  g_web->on("/", HTTP_GET, handleInfo);
+  g_web->on("/", HTTP_GET, handlePanel);
+  g_web->on("/api/state", HTTP_GET, handleState);
+  g_web->on("/api/settings", HTTP_POST, handleSettingsPost);
+  g_web->on("/api/logo", HTTP_POST, handleLogoDone, handleLogoUpload);
+  g_web->on("/api/logo/delete", HTTP_POST, handleLogoDelete);
   g_web->on("/window", HTTP_GET, handleWindow);
   g_web->on("/tokens", HTTP_POST, handleTokensPost);
+  g_web->on("/update", HTTP_GET, handleUpdatePage);
+  g_web->on("/update", HTTP_POST, handleUpdateDone, handleUpdateUpload);
   g_web->onNotFound([]() { g_web->send(404, "application/json", "{\"error\":\"not_found\"}"); });
   g_web->begin();
 }
@@ -2045,13 +2402,13 @@ static void ui_main() {
   lv_obj_set_pos(hIcon, 12, 10);               // 58x36 num header de 56px
   lv_obj_t *hWord = lv_image_create(scr);
   int logoEnd, badgeEnd;
-  if (partnerLogoPresent()) {
+  if (logo_present()) {
     // Slot de parceiro preenchido: sem wordmark; o logo fica centrado no header,
     // na mesma faixa vertical de 36px (ver partner_slot.h).
-    lv_image_set_src(hWord, partner_dsc());
-    lv_obj_align(hWord, LV_ALIGN_TOP_MID, 0, 10 + (36 - partnerLogoH()) / 2);
+    lv_image_set_src(hWord, logo_dsc());
+    lv_obj_align(hWord, LV_ALIGN_TOP_MID, 0, 10 + (36 - logo_h()) / 2);
     logoEnd = 12 + 58;                         // hotspot cobre so o Clawd
-    badgeEnd = 240 - partnerLogoW() / 2 - 8;
+    badgeEnd = 240 - logo_w() / 2 - 8;
   } else {
     lv_image_set_src(hWord, &img_wordmark);
     lv_obj_set_pos(hWord, 80, 10);
@@ -2165,7 +2522,7 @@ static const int POLL_OPTS[] = {15, 30, 60, 120, 300};
 static const int TZ_OPTS[] = {-3, -4, -5, -6, -7, -8, -2, -1, 0, 1, 2, 3};
 #define NTZ ((int)(sizeof(TZ_OPTS) / sizeof(TZ_OPTS[0])))
 
-static lv_obj_t *g_wkMascLbl = nullptr;
+static lv_obj_t *g_wkMascLbl = nullptr, *g_otaSetLbl = nullptr;
 static void week_masc_txt(char *out, size_t sz) {
   const char *n[4] = {TRS("desligado", "off"), "Clawd", TRS("rodizio", "rotation"), TRS("humor", "mood")};
   snprintf(out, sz, TRS(LV_SYMBOL_IMAGE "  Mascote semanal: %s", LV_SYMBOL_IMAGE "  Weekly mascot: %s"),
@@ -2261,6 +2618,18 @@ static void settings_action_cb(lv_event_t *e) {
       g_prefs.putInt("wmasc", g_weekMasc);
       if (g_wkMascLbl) { char m[64]; week_masc_txt(m, sizeof(m)); lv_label_set_text(g_wkMascLbl, m); }
       break;
+    case 13:                                           // abre janela de OTA (5 min)
+      g_otaUntil = millis() + OTA_WINDOW_MS;
+      if (!g_otaUntil) g_otaUntil = 1;                 // 0 e o sentinela de "fechado"
+      Serial.println("[OTA] janela aberta por 5 min");
+      if (g_otaSetLbl) {
+        char m[80];
+        snprintf(m, sizeof(m), TRS(LV_SYMBOL_UPLOAD "  OTA aberto 5 min: %s/update",
+                                   LV_SYMBOL_UPLOAD "  OTA open 5 min: %s/update"),
+                 WiFi.localIP().toString().c_str());
+        lv_label_set_text(g_otaSetLbl, m);
+      }
+      break;
   }
 }
 static void add_setting_row(lv_obj_t *p, const char *txt, int act, uint32_t fg, lv_obj_t **out) {
@@ -2334,6 +2703,8 @@ static void ui_settings() {
   add_setting_row(lst, acctTxt,                                 11, C_TEXT, nullptr);
   add_setting_row(lst, TRS(LV_SYMBOL_KEYBOARD "  Trocar token",
                            LV_SYMBOL_KEYBOARD "  Change token"), 2, C_TEXT, nullptr);
+  add_setting_row(lst, TRS(LV_SYMBOL_UPLOAD "  Atualizar firmware (WiFi)",
+                           LV_SYMBOL_UPLOAD "  Update firmware (WiFi)"), 13, C_TEXT, &g_otaSetLbl);
   add_setting_row(lst, TRS(LV_SYMBOL_FILE "  Sobre",
                            LV_SYMBOL_FILE "  About"),           10, C_TEXT, nullptr);
   add_setting_row(lst, TRS(LV_SYMBOL_TRASH "  Apagar tudo",
@@ -2549,9 +2920,9 @@ static void ui_about() {
   snprintf(v, sizeof(v), "v" FW_VERSION " \xE2\x80\xA2 ESP32-S3 \xE2\x80\xA2 LVGL 9.2");
   lv_obj_t *ver = mklabel(scr, v, &lv_font_montserrat_12, C_FAINT);
   lv_obj_align(ver, LV_ALIGN_TOP_MID, 0, 122);
-  if (partnerLogoPresent()) {                // logo do parceiro ao lado da versao
+  if (logo_present()) {                // logo do parceiro ao lado da versao
     lv_obj_t *pl = lv_image_create(scr);
-    lv_image_set_src(pl, partner_dsc());
+    lv_image_set_src(pl, logo_dsc());
     lv_obj_align_to(pl, ver, LV_ALIGN_OUT_RIGHT_MID, 12, 0);
   }
 
@@ -2594,13 +2965,14 @@ static void render_state() {
   stop_web();                                 // cada tela sobe o servidor que precisa
   moment_close();                             // overlay vive em lv_layer_top
   lv_obj_clean(lv_layer_top());
+  g_otaLbl = nullptr;                    // vivia na layer_top
   // invalida ponteiros vivos antes de destruir a tela antiga
   memset(&g_ui, 0, sizeof(g_ui));
   g_mascN = 0;
   g_pinDots = g_pinMsg = nullptr;
   g_tokMsg = nullptr;
   g_nameTa = nullptr;
-  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = g_wkMascLbl = nullptr;
+  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = g_wkMascLbl = g_otaSetLbl = nullptr;
 
   lv_obj_clean(lv_screen_active());
   lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(C_BG), 0);
@@ -2825,6 +3197,7 @@ void setup() {
       Serial.printf("[HIST] migrando p/ multi-conta: %s\n", ok ? "ok" : "FALHOU");
     }
     load_history();
+    load_web_logo();
   }
 
   g_wifi.begin();
@@ -2880,7 +3253,7 @@ void loop() {
   }
 
   // Poll automático EM BACKGROUND (sem trocar de tela) + refresh manual
-  if (g_state == ST_MAIN &&
+  if (g_state == ST_MAIN && !g_otaBusy && !g_otaRebootAt &&   // sem TLS durante o OTA
       (g_wantRefresh || millis() - g_lastPollMs > (uint32_t)g_pollSec * 1000)) {
     g_wantRefresh = false;
     bg_refresh();           // seta g_lastPollMs no fim
@@ -2901,13 +3274,9 @@ void loop() {
   static uint32_t offlineSince = 0;
   if (g_wifi.isConnected() || !g_sessionPin[0] || g_state == ST_WIFI) offlineSince = 0;
   else if (!offlineSince) offlineSince = millis();
-  else if (millis() - offlineSince > WIFI_REBOOT_AFTER_MS) {
-    Serial.println("[WIFI] offline ha muito tempo, reiniciando");
-    g_rtc.magic = RTC_PIN_MAGIC;
-    strlcpy(g_rtc.pin, g_sessionPin, sizeof(g_rtc.pin));
-    Serial.flush();
-    ESP.restart();
-  }
+  else if (millis() - offlineSince > WIFI_REBOOT_AFTER_MS) reboot_keep_session("WiFi offline");
+
+  if (g_otaRebootAt && (int32_t)(millis() - g_otaRebootAt) >= 0) reboot_keep_session("OTA");
 
   // Contagem do bloqueio por PIN errado. 250ms para o segundo virar sem atraso
   // visivel; o tick so reescreve o label quando o valor muda. So ST_PIN: o

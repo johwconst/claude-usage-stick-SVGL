@@ -7,6 +7,12 @@
 #   ./build.sh upload          # compila + grava (porta padrão abaixo)
 #   ./build.sh upload <porta>  # compila + grava na porta indicada
 #   ./build.sh monitor <porta> # abre o serial monitor (115200)
+#   ./build.sh ota <ip|host>   # compila + grava pelo WiFi (pagina /update do device)
+#     Antes, no device: Ajustes > Atualizar firmware (abre a janela de OTA por 5 min).
+#     Sem host, usa claude-stick.local (mDNS).
+#
+# Todo build exporta o binario em build/claude_stick.bin (gitignored) — e o
+# arquivo que se escolhe no painel web (http://<device>/) para atualizar por OTA.
 #
 # Opcao (em qualquer posicao): --logo <arquivo.png|svg>
 #   Grava o logo de um parceiro no lugar do wordmark "CLAUDE CODE" do header.
@@ -29,6 +35,9 @@ PORT_DEFAULT="/dev/cu.usbmodem101"
 
 LVFLAGS="-DLV_CONF_INCLUDE_SIMPLE -I${SKETCH_DIR}"
 
+OUT_DIR="$SKETCH_DIR/build"                 # gitignored (firmware/*/build/)
+BIN="$OUT_DIR/claude_stick.bin"
+
 # --logo <arquivo> pode vir antes ou depois de cmd/porta
 logo=""; args=()
 while [ $# -gt 0 ]; do
@@ -41,10 +50,8 @@ done
 cmd="${args[0]:-build}"
 port="${args[1]:-$PORT_DEFAULT}"
 
-# Com --logo: compila para um diretorio de saida, aplica o patch no .bin e grava
-# a partir dele (arduino-cli upload --input-dir usa os .bin exportados).
-if [ -n "$logo" ] && [ "$cmd" != "monitor" ]; then
-  OUT_DIR="$(mktemp -d)"
+# Compila para OUT_DIR, aplica o logo (se houver) e exporta build/claude_stick.bin.
+compile() {
   echo "==> compilando ($FQBN)"
   arduino-cli compile \
     --fqbn "$FQBN" \
@@ -52,41 +59,39 @@ if [ -n "$logo" ] && [ "$cmd" != "monitor" ]; then
     --build-property "compiler.c.extra_flags=$LVFLAGS" \
     --output-dir "$OUT_DIR" \
     "$SKETCH_DIR"
-  echo "==> logo do parceiro: $logo"
-  python3 "$SKETCH_DIR/../../tools/partner_logo.py" "$OUT_DIR/claude_stick.ino.bin" "$logo"
-  if [ "$cmd" = "upload" ]; then
-    echo "==> gravando em $port"
-    arduino-cli upload --fqbn "$FQBN" -p "$port" --input-dir "$OUT_DIR" "$SKETCH_DIR"
-  else
-    echo "==> binario com logo: $OUT_DIR/claude_stick.ino.bin"
+  if [ -n "$logo" ]; then
+    echo "==> logo do parceiro: $logo"
+    python3 "$SKETCH_DIR/../../tools/partner_logo.py" "$OUT_DIR/claude_stick.ino.bin" "$logo"
   fi
-  exit 0
-fi
+  cp "$OUT_DIR/claude_stick.ino.bin" "$BIN"
+  echo "==> binario: $BIN"
+}
 
 case "$cmd" in
   monitor)
     exec arduino-cli monitor -p "$port" -c baudrate=115200
     ;;
   build)
-    echo "==> compilando ($FQBN)"
-    arduino-cli compile \
-      --fqbn "$FQBN" \
-      --build-property "compiler.cpp.extra_flags=$LVFLAGS" \
-      --build-property "compiler.c.extra_flags=$LVFLAGS" \
-      "$SKETCH_DIR"
+    compile
     ;;
   upload)
-    # `compile --upload` compila e grava num passo só (upload puro não aceita --build-property)
-    echo "==> compilando + gravando em $port ($FQBN)"
-    arduino-cli compile \
-      --fqbn "$FQBN" \
-      --build-property "compiler.cpp.extra_flags=$LVFLAGS" \
-      --build-property "compiler.c.extra_flags=$LVFLAGS" \
-      --upload -p "$port" \
-      "$SKETCH_DIR"
+    # grava a partir do OUT_DIR (upload puro nao aceita --build-property, entao
+    # compila antes; o --input-dir pega os .bin exportados, logo incluso)
+    compile
+    echo "==> gravando em $port"
+    arduino-cli upload --fqbn "$FQBN" -p "$port" --input-dir "$OUT_DIR" "$SKETCH_DIR"
+    ;;
+  ota)
+    # POST multipart para http://<host>/update. O device valida a imagem,
+    # reinicia e volta ao dashboard sem pedir PIN.
+    host="${args[1]:-claude-stick.local}"
+    compile
+    echo "==> enviando para http://$host/update"
+    curl --fail-with-body -sS -F "firmware=@$BIN" "http://$host/update"
+    echo
     ;;
   *)
-    echo "comando desconhecido: $cmd (use: build | upload | monitor)" >&2
+    echo "comando desconhecido: $cmd (use: build | upload | ota | monitor)" >&2
     exit 1
     ;;
 esac
