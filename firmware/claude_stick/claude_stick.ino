@@ -119,6 +119,13 @@ static uint32_t g_lastOkMs = 0;           // millis do último sucesso (p/ "atua
 // ---- Brilho ----
 static const uint8_t BRI_LEVELS[3] = {60, 160, 255};
 static int g_briIdx = 1;
+// Escurecer quando parado + modo noite (config NVS, tela e painel web)
+static int  g_dimMin = 0;                 // min sem toque p/ escurecer: 0=off, 1/5/10/30
+static bool g_nightOn = false;            // apaga a tela no horario abaixo
+static int  g_nightFrom = 22, g_nightTo = 7;   // horas locais; pode cruzar a meia-noite
+static uint8_t g_blNow = 0;               // duty atual do backlight
+#define BL_DIM        18                  // brilho "escurecido"
+#define NIGHT_WAKE_MS 30000UL             // de noite, um toque acende por 30s
 
 static uint32_t g_lastPollMs = 0;         // millis do último poll (p/ barra de refresh)
 static int g_pollSec = DEFAULT_POLL_SEC;  // intervalo de atualização (config, NVS)
@@ -152,9 +159,15 @@ static int g_dayN = 0;
 #define NMODELS 4                     // 0=Haiku 1=Sonnet 2=Opus 3=Fable
 struct Mascot {
   lv_obj_t *cont, *img, *lid[2], *drop, *pupil[2], *fx[3];   // fx: particulas do humor
+  lv_obj_t *heart[3], *bang;                                 // coracoes / "!" das reacoes
+  int react; uint32_t reactAt;                               // reacao em curso (REACT_*)
   int baseX, baseY, mood, scale;                             // scale: 256 = 1x
   uint32_t bornMs, lookAt, lookUntil;                        // pulinho / olhar p/ os lados
 };
+// Reacoes a eventos (toque, janela reiniciou, passou de 90%)
+enum { REACT_NONE, REACT_HOP, REACT_HEARTS, REACT_PARTY, REACT_SCARED };
+static const uint16_t REACT_MS[] = {0, 600, 1600, 2000, 1500};
+static int g_mascEvt = REACT_NONE;      // evento do ultimo poll, aplicado ao mostrar o mascote
 #define MASC_TICK_MS 40                 // ~25 fps; se o touch pesar, voltar p/ 60-80
 // prototipos explicitos: o gerador do Arduino poria os automaticos antes do struct
 static void masc_scale(Mascot &m, float sx, float sy);
@@ -193,6 +206,7 @@ static void refresh_ui_values();
 static void dash_tick();
 static void set_hdr_status();
 static void apply_tz();
+static void apply_brightness();
 static void week_face_apply();
 static void ui_pin();
 static void pin_lock_tick();
@@ -308,12 +322,15 @@ static void disp_flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px
 }
 static void touch_read_cb(lv_indev_t *indev, lv_indev_data_t *data) {
   uint16_t x, y;
+  static bool swallow = false;          // toque que acordou a tela: engole ate soltar
   if (touch_dev.touched()) {
     touch_dev.readData(&x, &y);
     data->point.x = x; data->point.y = y;
-    data->state = LV_INDEV_STATE_PRESSED;
-    g_lastTouchMs = millis();          // pausa o slideshow enquanto ha interacao
+    g_lastTouchMs = millis();          // pausa o slideshow / acorda a tela
+    if (g_blNow == 0) { swallow = true; apply_brightness(); }
+    data->state = swallow ? LV_INDEV_STATE_RELEASED : LV_INDEV_STATE_PRESSED;
   } else {
+    swallow = false;
     data->state = LV_INDEV_STATE_RELEASED;
   }
 }
@@ -416,6 +433,11 @@ static void load_persisted() {
   g_pinAttempts = g_prefs.getInt("pinatt", 0);
   g_briIdx = g_prefs.getInt("bri", 1);
   if (g_briIdx < 0 || g_briIdx > 2) g_briIdx = 1;
+  g_dimMin = g_prefs.getInt("dim", 0);
+  if (g_dimMin != 0 && g_dimMin != 1 && g_dimMin != 5 && g_dimMin != 10 && g_dimMin != 30) g_dimMin = 0;
+  g_nightOn = g_prefs.getBool("night", false);
+  g_nightFrom = constrain(g_prefs.getInt("nfrom", 22), 0, 23);
+  g_nightTo = constrain(g_prefs.getInt("nto", 7), 0, 23);
   g_pollSec = g_prefs.getInt("poll", DEFAULT_POLL_SEC);
   if (g_pollSec < MIN_POLL_SEC || g_pollSec > MAX_POLL_SEC) g_pollSec = DEFAULT_POLL_SEC;
   g_tzOffset = g_prefs.getInt("tz", -3);
@@ -430,7 +452,24 @@ static void load_persisted() {
   g_lang = g_prefs.getInt("lang", 0) ? 1 : 0;
 }
 static void save_attempts() { g_prefs.putInt("pinatt", g_pinAttempts); }
-static void apply_brightness() { ledcWrite(TFT_BL, BRI_LEVELS[g_briIdx]); }
+// Noite so vale com relogio sincronizado. from == to = janela vazia.
+static bool night_now() {
+  if (!g_nightOn || g_nightFrom == g_nightTo) return false;
+  time_t t = time(nullptr);
+  if (t < 1000000000L) return false;
+  struct tm lt; localtime_r(&t, &lt);
+  int h = lt.tm_hour;
+  return g_nightFrom < g_nightTo ? (h >= g_nightFrom && h < g_nightTo)
+                                 : (h >= g_nightFrom || h < g_nightTo);
+}
+static uint8_t backlight_target() {
+  uint32_t idle = millis() - g_lastTouchMs;
+  uint8_t full = BRI_LEVELS[g_briIdx];
+  if (night_now() && idle > NIGHT_WAKE_MS) return 0;
+  if (g_dimMin && idle > (uint32_t)g_dimMin * 60000UL) return full < BL_DIM ? full : BL_DIM;
+  return full;
+}
+static void apply_brightness() { g_blNow = backlight_target(); ledcWrite(TFT_BL, g_blNow); }
 
 static void reset_history_ram();
 
@@ -1040,6 +1079,10 @@ label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}select{wid
 <div><label>Slideshow</label><select name=slide><option value=0>desligado<option value=5>5 s<option value=10>10 s<option value=15>15 s<option value=30>30 s</select></div>
 <div><label>Mascote semanal</label><select name=wmasc><option value=1>Clawd<option value=2>rodizio<option value=3>humor<option value=0>desligado</select></div>
 <div><label>Idioma da tela</label><select name=lang><option value=0>Portugues<option value=1>English</select></div>
+<div><label>Escurecer quando parado</label><select name=dim><option value=0>desligado<option value=1>apos 1 min<option value=5>apos 5 min<option value=10>apos 10 min<option value=30>apos 30 min</select></div>
+<div><label>Modo noite (apaga a tela)</label><select name=night><option value=0>desligado<option value=1>ligado</select></div>
+<div><label>Noite: de</label><select name=nfrom id=nfrom></select></div>
+<div><label>Noite: ate</label><select name=nto id=nto></select></div>
 </div><button>Salvar</button><div id=msg></div></form>
 <div class=card><div class=lbl>LOGO DO HEADER</div><div class=cd id=lgst></div>
 <canvas id=lgc width=0 height=0 style="background:#0F0F12;border-radius:6px;margin-top:10px;max-width:100%"></canvas>
@@ -1052,6 +1095,7 @@ label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}select{wid
 </main><script>
 const $=i=>document.getElementById(i);
 for(let z=-12;z<=14;z++){const o=document.createElement('option');o.value=z;o.textContent=(z>=0?'+':'')+z;$('tz').appendChild(o)}
+for(const id of['nfrom','nto'])for(let h=0;h<24;h++){const o=document.createElement('option');o.value=h;o.textContent=String(h).padStart(2,'0')+'h';$(id).appendChild(o)}
 const col=p=>p>=90?'var(--bad)':p>=70?'var(--warn)':'var(--ok)';
 function cd(ep,now){if(!ep||!now)return'';let s=ep-now;if(s<=0)return'resetando...';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
 const t=new Date(ep*1000).toLocaleString('pt-BR',{weekday:'short',hour:'2-digit',minute:'2-digit'});return'reseta em '+(d?d+'d ':'')+h+'h'+String(m).padStart(2,'0')+' ('+t+')'}
@@ -1065,7 +1109,7 @@ async function load(){try{const r=await fetch('/api/state');const j=await r.json
 card(5,j.h5,j.h5_reset,j.now);card(7,j.d7,j.d7_reset,j.now);chart(j.hist);
 const age=j.last_ok_s<0?'nunca':j.last_ok_s<60?j.last_ok_s+'s':Math.round(j.last_ok_s/60)+'min';
 $('sub').textContent=`@${j.account} \u2022 ${j.status||'-'} \u2022 atualizado ha ${age}`+(j.fetch_ok?'':' \u2022 ultima atualizacao FALHOU')+` \u2022 v${j.fw}`;
-if(!loaded){for(const k of['poll','bri','tz','slide','wmasc','lang'])$('f')[k].value=j.cfg[k];loaded=true}
+if(!loaded){for(const k of['poll','bri','tz','slide','wmasc','lang','dim','night','nfrom','nto'])$('f')[k].value=j.cfg[k];loaded=true}
 $('otast').textContent=j.ota_s>0?`Janela de OTA aberta: ${Math.floor(j.ota_s/60)}:${String(j.ota_s%60).padStart(2,'0')} restantes`
 :'Janela de OTA fechada. No device: Ajustes \u2192 Atualizar firmware (abre por 5 min).';
 $('lgst').textContent={web:'Logo atual: enviada pelo painel.',build:'Logo atual: gravada no firmware (--logo).',none:'Sem logo: o header mostra o texto CLAUDE CODE.'}[j.logo]||'';
@@ -1172,14 +1216,16 @@ static void handleState() {
            "{\"now\":%lu,\"h5\":%.1f,\"d7\":%.1f,\"h5_reset\":%lu,\"d7_reset\":%lu,"
            "\"status\":\"%s\",\"fetch_ok\":%s,\"last_ok_s\":%ld,\"account\":\"%s\",\"fw\":\"" FW_VERSION "\","
            "\"ota_s\":%lu,\"logo\":\"%s\","
-           "\"cfg\":{\"poll\":%d,\"bri\":%d,\"tz\":%d,\"slide\":%d,\"wmasc\":%d,\"lang\":%d},\"hist\":[",
+           "\"cfg\":{\"poll\":%d,\"bri\":%d,\"tz\":%d,\"slide\":%d,\"wmasc\":%d,\"lang\":%d,"
+           "\"dim\":%d,\"night\":%d,\"nfrom\":%d,\"nto\":%d},\"hist\":[",
            (unsigned long)time(nullptr), g_usage.h5, g_usage.d7,
            (unsigned long)g_usage.h5ResetEpoch, (unsigned long)g_usage.d7ResetEpoch,
            g_usage.statusOverall, g_lastFetchOk ? "true" : "false", lastOk,
            g_accts.label[g_accts.active],
            ota_open() ? (unsigned long)((g_otaUntil - millis()) / 1000) : 0UL,
            g_logoPx ? "web" : (partnerLogoPresent() ? "build" : "none"),
-           g_pollSec, g_briIdx, g_tzOffset, g_slideSec, g_weekMasc, (int)g_lang);
+           g_pollSec, g_briIdx, g_tzOffset, g_slideSec, g_weekMasc, (int)g_lang,
+           g_dimMin, g_nightOn ? 1 : 0, g_nightFrom, g_nightTo);
   j += b;
   for (int i = 0; i < g_histN; i++) {
     const Sample &sm = g_hist[hist_idx(i)];
@@ -1226,6 +1272,26 @@ static void handleSettingsPost() {
     if (v != 0 && v != 1) { g_web->send(400, "text/plain", "lang"); return; }
     langChanged = (v != g_lang);
     g_lang = (uint8_t)v; g_prefs.putInt("lang", v);
+  }
+  if (has("dim")) {
+    int v = num("dim");
+    if (v != 0 && v != 1 && v != 5 && v != 10 && v != 30) { g_web->send(400, "text/plain", "dim"); return; }
+    g_dimMin = v; g_prefs.putInt("dim", v);
+  }
+  if (has("night")) {
+    int v = num("night");
+    if (v != 0 && v != 1) { g_web->send(400, "text/plain", "night"); return; }
+    g_nightOn = v; g_prefs.putBool("night", g_nightOn);
+  }
+  if (has("nfrom")) {
+    int v = num("nfrom");
+    if (v < 0 || v > 23) { g_web->send(400, "text/plain", "nfrom"); return; }
+    g_nightFrom = v; g_prefs.putInt("nfrom", v);
+  }
+  if (has("nto")) {
+    int v = num("nto");
+    if (v < 0 || v > 23) { g_web->send(400, "text/plain", "nto"); return; }
+    g_nightTo = v; g_prefs.putInt("nto", v);
   }
   Serial.println("[WEB] ajustes atualizados pelo painel");
   g_web->send(200, "text/plain", "ok");
@@ -1795,6 +1861,29 @@ static lv_obj_t *build_model_mascot(lv_obj_t *parent, int cx, int baseY, int i, 
     lv_obj_set_style_opa(c, 140, 0);
   }
   if (mood == 3) m.fx[0] = rrect(c, 37, 2, 14, 8, 4, 0x6A6A74);   // nuvenzinha
+  for (int k = 0; k < 3; k++) {          // coracao pixel 7x6, oculto ate uma reacao
+    lv_obj_t *h = rrect(c, 14 + k * 26, 14, 7, 6, 0, 0);
+    lv_obj_set_style_bg_opa(h, 0, 0);
+    rrect(h, 0, 0, 3, 3, 1, 0xF472B6); rrect(h, 4, 0, 3, 3, 1, 0xF472B6);
+    rrect(h, 0, 2, 7, 2, 0, 0xF472B6); rrect(h, 1, 4, 5, 1, 0, 0xF472B6);
+    rrect(h, 3, 5, 1, 1, 0, 0xF472B6);
+    lv_obj_add_flag(h, LV_OBJ_FLAG_HIDDEN);
+    m.heart[k] = h;
+  }
+  m.bang = rrect(c, 72, 0, 5, 14, 0, 0);  // "!" do susto
+  lv_obj_set_style_bg_opa(m.bang, 0, 0);
+  rrect(m.bang, 0, 0, 5, 9, 1, C_BAD); rrect(m.bang, 0, 11, 5, 3, 1, C_BAD);
+  lv_obj_add_flag(m.bang, LV_OBJ_FLAG_HIDDEN);
+  // Toque no Clawd: alterna pulinho / coracoes. Area de toque maior porque o
+  // container e escalado (o hit test usa o tamanho sem escala).
+  lv_obj_add_flag(c, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_set_ext_click_area(c, 30);
+  lv_obj_add_event_cb(c, [](lv_event_t *e) {
+    lv_obj_t *t = (lv_obj_t *)lv_event_get_current_target(e);
+    static int n = 0;
+    for (int i = 0; i < g_mascN; i++)
+      if (g_masc[i].cont == t) { g_masc[i].react = (n++ & 1) ? REACT_HEARTS : REACT_HOP; g_masc[i].reactAt = millis(); }
+  }, LV_EVENT_CLICKED, NULL);
   g_mascN++;
   return c;
 }
@@ -1845,6 +1934,11 @@ static void week_face_apply() {
     lv_obj_set_style_transform_pivot_y(m, 40, 0);
     lv_obj_set_style_transform_scale(m, 460, 0);   // 256 = 1x
     g_masc[g_mascN - 1].scale = 460;               // base da respiracao/achatamento
+    if (g_mascEvt) {                               // reacao depois do pulinho de entrada
+      g_masc[g_mascN - 1].react = g_mascEvt;
+      g_masc[g_mascN - 1].reactAt = millis() + 700;
+      g_mascEvt = REACT_NONE;
+    }
   }
   lv_obj_clear_flag(p, LV_OBJ_FLAG_HIDDEN);
 }
@@ -2182,6 +2276,8 @@ static lv_point_precise_t g_moXPts[4][2];      // olhos em X (KO)
 static void check_thresholds() {
   float c[2] = {g_usage.h5, g_usage.d7};
   for (int w = 0; w < 2; w++) {
+    if (g_thrBase && (g_thrPrev[w] - c[w]) > 15.0f && g_mascEvt != REACT_SCARED)
+      g_mascEvt = REACT_PARTY;           // janela reiniciou: Clawd comemora
     if (!g_thrBase || (g_thrPrev[w] - c[w]) > 15.0f) {
       g_thrFired[w] = 0;
       for (int i = 0; i < 4; i++) if (c[w] >= THR[i]) g_thrFired[w] |= 1 << i;
@@ -2191,6 +2287,8 @@ static void check_thresholds() {
         if (c[w] >= THR[i] && !(g_thrFired[w] & (1 << i))) { g_thrFired[w] |= 1 << i; hit = i; }
       if (hit >= 0) { g_pendWin = w; g_pendThr = THR[hit]; }
     }
+    if (g_thrBase && g_thrPrev[w] < 90.0f && c[w] >= 90.0f)
+      g_mascEvt = REACT_SCARED;          // cruzou 90%: Clawd se assusta
     g_thrPrev[w] = c[w];
   }
   g_thrBase = true;
@@ -2522,7 +2620,19 @@ static const int POLL_OPTS[] = {15, 30, 60, 120, 300};
 static const int TZ_OPTS[] = {-3, -4, -5, -6, -7, -8, -2, -1, 0, 1, 2, 3};
 #define NTZ ((int)(sizeof(TZ_OPTS) / sizeof(TZ_OPTS[0])))
 
-static lv_obj_t *g_wkMascLbl = nullptr, *g_otaSetLbl = nullptr;
+static lv_obj_t *g_wkMascLbl = nullptr, *g_otaSetLbl = nullptr, *g_dimLbl = nullptr, *g_nightLbl = nullptr;
+static void dim_txt(char *out, size_t sz) {
+  if (g_dimMin) snprintf(out, sz, TRS(LV_SYMBOL_EYE_CLOSE "  Escurecer: apos %d min",
+                                      LV_SYMBOL_EYE_CLOSE "  Dim: after %d min"), g_dimMin);
+  else snprintf(out, sz, "%s", TRS(LV_SYMBOL_EYE_CLOSE "  Escurecer: desligado",
+                                   LV_SYMBOL_EYE_CLOSE "  Dim: off"));
+}
+static void night_txt(char *out, size_t sz) {
+  if (g_nightOn) snprintf(out, sz, TRS(LV_SYMBOL_POWER "  Modo noite: %02dh-%02dh",
+                                       LV_SYMBOL_POWER "  Night mode: %02dh-%02dh"), g_nightFrom, g_nightTo);
+  else snprintf(out, sz, "%s", TRS(LV_SYMBOL_POWER "  Modo noite: desligado (horario no painel web)",
+                                   LV_SYMBOL_POWER "  Night mode: off (hours in web panel)"));
+}
 static void week_masc_txt(char *out, size_t sz) {
   const char *n[4] = {TRS("desligado", "off"), "Clawd", TRS("rodizio", "rotation"), TRS("humor", "mood")};
   snprintf(out, sz, TRS(LV_SYMBOL_IMAGE "  Mascote semanal: %s", LV_SYMBOL_IMAGE "  Weekly mascot: %s"),
@@ -2618,6 +2728,20 @@ static void settings_action_cb(lv_event_t *e) {
       g_prefs.putInt("wmasc", g_weekMasc);
       if (g_wkMascLbl) { char m[64]; week_masc_txt(m, sizeof(m)); lv_label_set_text(g_wkMascLbl, m); }
       break;
+    case 14: {                                         // escurecer: off -> 1 -> 5 -> 10 -> 30 -> off
+      static const int DM[5] = {0, 1, 5, 10, 30};
+      int idx = 0;
+      for (int i = 0; i < 5; i++) if (DM[i] == g_dimMin) idx = i;
+      g_dimMin = DM[(idx + 1) % 5];
+      g_prefs.putInt("dim", g_dimMin);
+      if (g_dimLbl) { char m[64]; dim_txt(m, sizeof(m)); lv_label_set_text(g_dimLbl, m); }
+      break;
+    }
+    case 15:                                           // modo noite liga/desliga
+      g_nightOn = !g_nightOn;
+      g_prefs.putBool("night", g_nightOn);
+      if (g_nightLbl) { char m[80]; night_txt(m, sizeof(m)); lv_label_set_text(g_nightLbl, m); }
+      break;
     case 13:                                           // abre janela de OTA (5 min)
       g_otaUntil = millis() + OTA_WINDOW_MS;
       if (!g_otaUntil) g_otaUntil = 1;                 // 0 e o sentinela de "fechado"
@@ -2694,6 +2818,10 @@ static void ui_settings() {
                            LV_SYMBOL_LIST "  Language: English"), 9, C_TEXT, nullptr);
   add_setting_row(lst, tzTxt,                                    7, C_TEXT, &g_tzLbl);
   add_setting_row(lst, bri,                                      3, C_TEXT, &g_briLbl);
+  char dimTxt[64]; dim_txt(dimTxt, sizeof(dimTxt));
+  add_setting_row(lst, dimTxt,                                  14, C_TEXT, &g_dimLbl);
+  char nightTxt[80]; night_txt(nightTxt, sizeof(nightTxt));
+  add_setting_row(lst, nightTxt,                                15, C_TEXT, &g_nightLbl);
   add_setting_row(lst, TRS(LV_SYMBOL_WIFI "  Configurar WiFi",
                            LV_SYMBOL_WIFI "  Configure WiFi"),   1, C_TEXT, nullptr);
   char acctTxt[64];
@@ -2972,7 +3100,7 @@ static void render_state() {
   g_pinDots = g_pinMsg = nullptr;
   g_tokMsg = nullptr;
   g_nameTa = nullptr;
-  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = g_wkMascLbl = g_otaSetLbl = nullptr;
+  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = g_wkMascLbl = g_otaSetLbl = g_dimLbl = g_nightLbl = nullptr;
 
   lv_obj_clean(lv_screen_active());
   lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(C_BG), 0);
@@ -3056,7 +3184,8 @@ static void bg_refresh() {
   g_refreshing = false;
   g_lastPollMs = millis();
   refresh_ui_values();                    // in-place (preserva o tile atual)
-  g_weekFlip = !g_weekFlip;               // card SEMANA: consumo <-> mascote
+  // card SEMANA: consumo <-> mascote. Evento (comemorar/susto) mostra o mascote.
+  g_weekFlip = (g_mascEvt && g_weekMasc) ? true : !g_weekFlip;
   week_face_apply();
 }
 
@@ -3097,6 +3226,38 @@ static void masc_tick(Mascot &m, uint32_t now, int i) {
     x += ((now / MASC_TICK_MS) & 1) ? 1 : -1;
   } else if (m.mood == 3) {                          // preocupado: "nega" de lado
     x += (int)(4 * sinf(ph * 0.5f));
+  }
+  // Reacao em curso sobrepoe o idle (so depois do pulinho de entrada)
+  bool heartsOn = false, bangOn = false;
+  if (m.react && age >= 700 && (int32_t)(now - m.reactAt) >= 0) {
+    uint32_t r = now - m.reactAt;
+    if (r >= REACT_MS[m.react]) m.react = REACT_NONE;
+    else if (m.react == REACT_HOP) {                 // pulo alto com achatamento no pouso
+      y = m.baseY - (int)(30 * sinf(r / 600.0f * (float)M_PI));
+      if (r > 480) { float t = (600 - r) / 120.0f; sx = 1 + 0.10f * t; sy = 1 - 0.12f * t; }
+    } else if (m.react == REACT_HEARTS) {            // coracoes subindo
+      heartsOn = true;
+      y = m.baseY - (int)(4 * fabsf(sinf(r / 200.0f)));
+    } else if (m.react == REACT_PARTY) {             // 2 pulos + coracoes + balanco
+      heartsOn = true;
+      y = m.baseY - (int)(22 * fabsf(sinf(r / 500.0f * (float)M_PI)));
+      x = m.baseX + (int)(4 * sinf(r / 90.0f));
+    } else if (m.react == REACT_SCARED) {            // salto curto, tremedeira e "!"
+      bangOn = true;
+      y = m.baseY - (r < 250 ? (int)(14 * sinf(r / 250.0f * (float)M_PI)) : 0);
+      x = m.baseX + ((r / 40) & 1 ? 3 : -3);
+      sx = 0.94f; sy = 1.06f;                        // "encolhe" de medo
+    }
+  }
+  for (int k = 0; k < 3; k++) {
+    if (!m.heart[k]) continue;
+    if (!heartsOn) { lv_obj_add_flag(m.heart[k], LV_OBJ_FLAG_HIDDEN); continue; }
+    lv_obj_clear_flag(m.heart[k], LV_OBJ_FLAG_HIDDEN);
+    masc_fx_rise(m.heart[k], (now - m.reactAt + k * 300) % 900, 900, 16, 16);
+  }
+  if (m.bang) {
+    if (bangOn) lv_obj_clear_flag(m.bang, LV_OBJ_FLAG_HIDDEN);
+    else lv_obj_add_flag(m.bang, LV_OBJ_FLAG_HIDDEN);
   }
   lv_obj_set_pos(m.cont, x, y);
   masc_scale(m, sx, sy);
@@ -3277,6 +3438,10 @@ void loop() {
   else if (millis() - offlineSince > WIFI_REBOOT_AFTER_MS) reboot_keep_session("WiFi offline");
 
   if (g_otaRebootAt && (int32_t)(millis() - g_otaRebootAt) >= 0) reboot_keep_session("OTA");
+
+  // Backlight: escurecer quando parado / modo noite (so escreve se mudar)
+  static uint32_t lastBl = 0;
+  if (millis() - lastBl > 500) { lastBl = millis(); if (backlight_target() != g_blNow) apply_brightness(); }
 
   // Contagem do bloqueio por PIN errado. 250ms para o segundo virar sem atraso
   // visivel; o tick so reescreve o label quando o valor muda. So ST_PIN: o
